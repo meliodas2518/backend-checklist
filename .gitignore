@@ -1,0 +1,7 @@
+node_modules
+.env
+driveToken.json
+driveOAuthClient.json
+serviceAccountKey.json
+serviceAccountDrive.json
+.expo
