@@ -1,7 +1,4 @@
-// backend/index.js
 require("dotenv").config();
-const fs = require("fs");
-const path = require("path");
 const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
@@ -11,29 +8,35 @@ const { Readable } = require("stream");
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "25mb" })); // base64 grande
+app.use(express.json({ limit: "25mb" }));
 
 // --------------------- Utils ---------------------
 function mustEnv(name) {
-  if (!process.env[name]) {
-    throw new Error(`ENV faltando: ${name}`);
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing env var: ${name}`);
+  return v;
+}
+
+function loadJsonEnv(name) {
+  const raw = mustEnv(name);
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    throw new Error(`Invalid JSON in env var ${name}: ${e.message}`);
   }
 }
 
-const PORT = process.env.PORT || 3000;
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
+// --------------------- Firebase Admin (via ENV) ---------------------
+const firebaseServiceAccount = loadJsonEnv("FIREBASE_SERVICE_ACCOUNT_JSON");
 
-// --------------------- Firebase Admin ---------------------
-const serviceAccount = require("./serviceAccountKey.json");
 admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
+  credential: admin.credential.cert(firebaseServiceAccount),
 });
 const db = admin.firestore();
 
 // --------------------- Mercado Pago ---------------------
-mustEnv("MP_ACCESS_TOKEN");
 const client = new MercadoPagoConfig({
-  accessToken: process.env.MP_ACCESS_TOKEN,
+  accessToken: mustEnv("MP_ACCESS_TOKEN"),
 });
 
 const PLANOS = {
@@ -45,54 +48,34 @@ const PLANOS = {
 
 console.log("MP TOKEN:", process.env.MP_ACCESS_TOKEN ? "OK" : "FALTANDO");
 
-// --------------------- Google Drive (OAuth) ---------------------
-// Você usa:
-// DRIVE_OAUTH_CREDENTIALS_JSON=./driveOAuthClient.json
-// DRIVE_OAUTH_TOKEN_JSON=./driveToken.json
-mustEnv("DRIVE_OAUTH_CREDENTIALS_JSON");
-mustEnv("DRIVE_OAUTH_TOKEN_JSON");
+// --------------------- Google Drive (OAuth via ENV) ---------------------
+function buildDriveClient() {
+  const credentials = loadJsonEnv("DRIVE_OAUTH_CREDENTIALS_JSON");
+  const token = loadJsonEnv("DRIVE_OAUTH_TOKEN_JSON");
 
-// Root folder (pasta onde vai criar CHECKLISTS dentro)
-const DRIVE_ROOT_FOLDER_ID = process.env.DRIVE_ROOT_FOLDER_ID || null;
+  // suporta "installed" ou "web"
+  const cfg = credentials.installed || credentials.web;
+  if (!cfg) throw new Error("DRIVE_OAUTH_CREDENTIALS_JSON precisa ter installed ou web");
 
-function loadJson(filePath) {
-  const abs = path.isAbsolute(filePath) ? filePath : path.join(__dirname, filePath);
-  return JSON.parse(fs.readFileSync(abs, "utf8"));
+  const redirectUri =
+    (cfg.redirect_uris && cfg.redirect_uris[0]) || "http://localhost";
+
+  const oauth2Client = new google.auth.OAuth2(
+    cfg.client_id,
+    cfg.client_secret,
+    redirectUri
+  );
+
+  oauth2Client.setCredentials(token);
+
+  return google.drive({ version: "v3", auth: oauth2Client });
 }
 
-const oauthClientInfo = loadJson(process.env.DRIVE_OAUTH_CREDENTIALS_JSON);
-const tokenInfo = loadJson(process.env.DRIVE_OAUTH_TOKEN_JSON);
+const drive = buildDriveClient();
 
-// driveOAuthClient.json normalmente vem como:
-// { "installed": { client_id, client_secret, redirect_uris[] } }
-// ou { "web": { ... } }
-const oauthCfg = oauthClientInfo.installed || oauthClientInfo.web;
-if (!oauthCfg?.client_id || !oauthCfg?.client_secret) {
-  throw new Error("driveOAuthClient.json inválido: faltando client_id/client_secret");
-}
-
-const oAuth2Client = new google.auth.OAuth2(
-  oauthCfg.client_id,
-  oauthCfg.client_secret,
-  (oauthCfg.redirect_uris && oauthCfg.redirect_uris[0]) || "http://localhost"
-);
-
-// tokenInfo precisa ter refresh_token
-if (!tokenInfo?.refresh_token) {
-  throw new Error("driveToken.json inválido: faltando refresh_token");
-}
-
-oAuth2Client.setCredentials({
-  refresh_token: tokenInfo.refresh_token,
-  access_token: tokenInfo.access_token, // pode existir, mas refresh_token é o principal
-  expiry_date: tokenInfo.expiry_date,
-});
-
-const drive = google.drive({ version: "v3", auth: oAuth2Client });
-
-// --------------------- Drive helpers ---------------------
 async function findOrCreateFolder(name, parentId) {
   const safeName = String(name).replace(/'/g, "\\'");
+
   const qParts = [
     `mimeType='application/vnd.google-apps.folder'`,
     `name='${safeName}'`,
@@ -104,17 +87,22 @@ async function findOrCreateFolder(name, parentId) {
     q: qParts.join(" and "),
     fields: "files(id,name)",
     spaces: "drive",
+    supportsAllDrives: true,
+    includeItemsFromAllDrives: true,
   });
 
-  if (list.data.files && list.data.files.length > 0) return list.data.files[0].id;
+  if (list.data.files && list.data.files.length > 0) {
+    return list.data.files[0].id;
+  }
 
   const created = await drive.files.create({
     requestBody: {
-      name,
+      name: String(name),
       mimeType: "application/vnd.google-apps.folder",
       parents: parentId ? [parentId] : undefined,
     },
     fields: "id",
+    supportsAllDrives: true,
   });
 
   return created.data.id;
@@ -134,32 +122,37 @@ async function uploadBase64ToDrive({ base64, mime, filename, parentId }) {
       body: stream,
     },
     fields: "id",
+    supportsAllDrives: true,
   });
 
   return created.data.id;
 }
 
-// --------------------- Rotas de FOTO ---------------------
-app.get("/health", (_, res) => res.json({ ok: true }));
+// --------------------- Rotas: Fotos (Drive) ---------------------
 
-// Upload foto: salva no Drive e retorna fileId
+// POST /upload-foto
+// body: { codigoPosto, runId, itemId, mime, base64 }
 app.post("/upload-foto", async (req, res) => {
   try {
-    const { codigoPosto, runId, itemId, mime, base64 } = req.body;
+    const { codigoPosto, runId, itemId, mime, base64 } = req.body || {};
 
     if (!codigoPosto || !runId || !itemId || !base64) {
-      return res.status(400).json({ error: "Dados faltando (codigoPosto/runId/itemId/base64)" });
+      return res
+        .status(400)
+        .json({ error: "Dados faltando (codigoPosto/runId/itemId/base64)" });
     }
 
-    // Estrutura: ROOT/(opcional) -> CHECKLISTS -> {codigoPosto} -> {runId}
-    const baseFolder = await findOrCreateFolder("CHECKLISTS", DRIVE_ROOT_FOLDER_ID);
+    const rootId = process.env.DRIVE_ROOT_FOLDER_ID || null;
+
+    // Estrutura:
+    // {ROOT}/CHECKLISTS/{codigoPosto}/{runId}
+    const baseFolder = await findOrCreateFolder("CHECKLISTS", rootId);
     const postoFolder = await findOrCreateFolder(String(codigoPosto), baseFolder);
     const runFolder = await findOrCreateFolder(String(runId), postoFolder);
 
-    const m = (mime || "image/jpeg").toLowerCase();
     const ext =
-      m.includes("png") ? "png" :
-      m.includes("webp") ? "webp" :
+      mime === "image/png" ? "png" :
+      mime === "image/webp" ? "webp" :
       "jpg";
 
     const filename = `${itemId}_${Date.now()}.${ext}`;
@@ -178,17 +171,25 @@ app.post("/upload-foto", async (req, res) => {
   }
 });
 
-// Retorna urls (proxy) para cada fileId
+// POST /signed-urls
+// body: { fileIds: string[] }
 app.post("/signed-urls", async (req, res) => {
   try {
-    const { fileIds } = req.body;
-    if (!Array.isArray(fileIds)) return res.status(400).json({ error: "fileIds inválido" });
+    const { fileIds } = req.body || {};
+    if (!Array.isArray(fileIds)) {
+      return res.status(400).json({ error: "fileIds inválido" });
+    }
+
+    const baseUrl =
+      process.env.PUBLIC_BASE_URL ||
+      `http://localhost:${process.env.PORT || 3000}`;
 
     const urls = {};
     for (const id of fileIds) {
       if (!id) continue;
-      urls[id] = `${PUBLIC_BASE_URL}/drive-file/${id}`;
+      urls[id] = `${baseUrl}/drive-file/${id}`;
     }
+
     return res.json({ urls });
   } catch (e) {
     console.error("signed-urls error:", e?.message || e);
@@ -196,7 +197,8 @@ app.post("/signed-urls", async (req, res) => {
   }
 });
 
-// Proxy do Drive: entrega a imagem
+// GET /drive-file/:id
+// Proxy do arquivo do Drive (imagem) sem login do cliente
 app.get("/drive-file/:id", async (req, res) => {
   try {
     const fileId = req.params.id;
@@ -204,6 +206,7 @@ app.get("/drive-file/:id", async (req, res) => {
     const meta = await drive.files.get({
       fileId,
       fields: "mimeType,name",
+      supportsAllDrives: true,
     });
 
     const mimeType = meta.data.mimeType || "image/jpeg";
@@ -211,7 +214,7 @@ app.get("/drive-file/:id", async (req, res) => {
     res.setHeader("Cache-Control", "public, max-age=86400");
 
     const file = await drive.files.get(
-      { fileId, alt: "media" },
+      { fileId, alt: "media", supportsAllDrives: true },
       { responseType: "stream" }
     );
 
@@ -228,10 +231,15 @@ app.get("/drive-file/:id", async (req, res) => {
 });
 
 // --------------------- Pagamento (MercadoPago) ---------------------
+
 app.post("/criar-pagamento", async (req, res) => {
   try {
-    const { plano, uid, email } = req.body;
+    const { plano, uid, email } = req.body || {};
+    if (!uid || !email || !plano) {
+      return res.status(400).json({ error: "Dados faltando" });
+    }
 
+    // valores (ajuste aqui)
     const planos = {
       mensal: { valor: 1.0, meses: 1, acessos: 1 },
       trimestral: { valor: 64.99, meses: 3, acessos: 1 },
@@ -241,9 +249,10 @@ app.post("/criar-pagamento", async (req, res) => {
 
     const p = planos[plano];
     if (!p) return res.status(400).json({ error: "Plano inválido" });
-    if (!uid || !email || !plano) return res.status(400).json({ error: "Dados faltando" });
 
     const preference = new Preference(client);
+
+    const notificationUrl = `${mustEnv("PUBLIC_BASE_URL")}/webhook/mercadopago`;
 
     const result = await preference.create({
       body: {
@@ -256,7 +265,7 @@ app.post("/criar-pagamento", async (req, res) => {
           },
         ],
         payer: { email },
-        notification_url: `${PUBLIC_BASE_URL}/webhook/mercadopago`,
+        notification_url: notificationUrl,
         metadata: { uid, plano, meses: p.meses, acessos: p.acessos },
         payment_methods: {
           excluded_payment_types: [],
@@ -266,10 +275,10 @@ app.post("/criar-pagamento", async (req, res) => {
       },
     });
 
-    res.json({ checkout_url: result.init_point });
+    return res.json({ checkout_url: result.init_point });
   } catch (err) {
-    console.error("🔥 ERRO CRIAR PAGAMENTO:", err);
-    res.status(500).json({ error: "Erro ao criar pagamento" });
+    console.error("🔥 ERRO CRIAR PAGAMENTO:", err?.message || err);
+    return res.status(500).json({ error: "Erro ao criar pagamento" });
   }
 });
 
@@ -296,11 +305,8 @@ app.post("/webhook/mercadopago", async (req, res) => {
     try {
       result = await payment.get({ id: paymentId });
     } catch (err) {
-      if (err?.error === "not_found") {
-        console.log("❌ Pagamento não encontrado, ignorando:", paymentId);
-        return res.sendStatus(200);
-      }
-      throw err;
+      console.log("⚠️ erro consultando pagamento:", err?.message || err);
+      return res.sendStatus(200);
     }
 
     if (result.status !== "approved") {
@@ -311,14 +317,23 @@ app.post("/webhook/mercadopago", async (req, res) => {
     const uid = result.metadata?.uid;
     const planoMeta = result.metadata?.plano;
 
-    if (!uid) return res.sendStatus(200);
+    if (!uid) {
+      console.log("❌ metadata.uid não veio no pagamento:", paymentId);
+      return res.sendStatus(200);
+    }
 
     const planoConfig = PLANOS[planoMeta];
-    if (!planoConfig) return res.sendStatus(200);
+    if (!planoConfig) {
+      console.log("❌ Plano inválido no metadata:", planoMeta);
+      return res.sendStatus(200);
+    }
 
     const userRef = db.collection("usuarios").doc(uid);
     const userSnap = await userRef.get();
-    if (!userSnap.exists) return res.sendStatus(200);
+    if (!userSnap.exists) {
+      console.log("❌ Usuário não encontrado por UID:", uid);
+      return res.sendStatus(200);
+    }
 
     const vencimento = new Date();
     vencimento.setMonth(vencimento.getMonth() + planoConfig.meses);
@@ -342,13 +357,16 @@ app.post("/webhook/mercadopago", async (req, res) => {
     console.log("✅ PLANO LIBERADO UID:", uid, "PLANO:", planoConfig.plano);
     return res.sendStatus(200);
   } catch (err) {
-    console.error("🔥 ERRO WEBHOOK MP:", err);
+    console.error("🔥 ERRO WEBHOOK MP:", err?.message || err);
     return res.sendStatus(500);
   }
 });
 
-// --------------------- Start ---------------------
-app.listen(PORT, () => {
-  console.log(`🚀 Server rodando na porta ${PORT}`);
-  console.log("🌍 PUBLIC_BASE_URL:", PUBLIC_BASE_URL);
+// --------------------- Healthcheck ---------------------
+app.get("/", (req, res) => {
+  res.json({ ok: true, service: "backend-checklist", ts: Date.now() });
 });
+
+// --------------------- Start ---------------------
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`🚀 Server rodando na porta ${PORT}`));
