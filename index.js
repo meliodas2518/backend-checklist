@@ -1,42 +1,57 @@
+// backend/index.js
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
+const crypto = require("crypto");
 const admin = require("firebase-admin");
 const { MercadoPagoConfig, Preference, Payment } = require("mercadopago");
 const { google } = require("googleapis");
 const { Readable } = require("stream");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
-app.use(cors());
+app.use(
+  cors({
+    origin: ["http://localhost:3001"],
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+
 app.use(express.json({ limit: "25mb" }));
 
-// --------------------- Utils ---------------------
-function mustEnv(name) {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing env var: ${name}`);
-  return v;
+// --------------------- ENV ---------------------
+const PORT = process.env.PORT || 3000;
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
+const SIGNING_SECRET = process.env.SIGNING_SECRET;
+
+if (!SIGNING_SECRET) {
+  console.warn("⚠️ SIGNING_SECRET não definido no .env (obrigatório para /drive-file assinado)");
 }
 
-function loadJsonEnv(name) {
-  const raw = mustEnv(name);
-  try {
-    return JSON.parse(raw);
-  } catch (e) {
-    throw new Error(`Invalid JSON in env var ${name}: ${e.message}`);
+// --------------------- Firebase Admin ---------------------
+function loadServiceAccount() {
+  if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+    return JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
   }
+  const file = path.join(__dirname, "serviceAccountKey.json");
+  if (fs.existsSync(file)) return require(file);
+  throw new Error(
+    "Faltando credencial do Firebase Admin. Use FIREBASE_SERVICE_ACCOUNT_JSON no Render ou serviceAccountKey.json local."
+  );
 }
 
-// --------------------- Firebase Admin (via ENV) ---------------------
-const firebaseServiceAccount = loadJsonEnv("FIREBASE_SERVICE_ACCOUNT_JSON");
+const serviceAccount = loadServiceAccount();
 
 admin.initializeApp({
-  credential: admin.credential.cert(firebaseServiceAccount),
+  credential: admin.credential.cert(serviceAccount),
 });
 const db = admin.firestore();
 
 // --------------------- Mercado Pago ---------------------
 const client = new MercadoPagoConfig({
-  accessToken: mustEnv("MP_ACCESS_TOKEN"),
+  accessToken: process.env.MP_ACCESS_TOKEN,
 });
 
 const PLANOS = {
@@ -48,34 +63,49 @@ const PLANOS = {
 
 console.log("MP TOKEN:", process.env.MP_ACCESS_TOKEN ? "OK" : "FALTANDO");
 
-// --------------------- Google Drive (OAuth via ENV) ---------------------
-function buildDriveClient() {
-  const credentials = loadJsonEnv("DRIVE_OAUTH_CREDENTIALS_JSON");
-  const token = loadJsonEnv("DRIVE_OAUTH_TOKEN_JSON");
+// --------------------- Google Drive (OAuth) ---------------------
+// Aceita JSON inline OU caminho de arquivo
+function readJsonFlexible(v) {
+  if (!v) return null;
 
-  // suporta "installed" ou "web"
-  const cfg = credentials.installed || credentials.web;
-  if (!cfg) throw new Error("DRIVE_OAUTH_CREDENTIALS_JSON precisa ter installed ou web");
+  const trimmed = String(v).trim();
+  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+    return JSON.parse(trimmed);
+  }
 
-  const redirectUri =
-    (cfg.redirect_uris && cfg.redirect_uris[0]) || "http://localhost";
-
-  const oauth2Client = new google.auth.OAuth2(
-    cfg.client_id,
-    cfg.client_secret,
-    redirectUri
-  );
-
-  oauth2Client.setCredentials(token);
-
-  return google.drive({ version: "v3", auth: oauth2Client });
+  const abs = path.isAbsolute(trimmed) ? trimmed : path.join(__dirname, trimmed);
+  return JSON.parse(fs.readFileSync(abs, "utf8"));
 }
 
-const drive = buildDriveClient();
+function createDriveClient() {
+  const credsVar = process.env.DRIVE_OAUTH_CREDENTIALS_JSON;
+  const tokenVar = process.env.DRIVE_OAUTH_TOKEN_JSON;
 
+  if (!credsVar || !tokenVar) {
+    throw new Error("Faltando DRIVE_OAUTH_CREDENTIALS_JSON ou DRIVE_OAUTH_TOKEN_JSON no .env");
+  }
+
+  const credentials = readJsonFlexible(credsVar);
+  const token = readJsonFlexible(tokenVar);
+
+  const { client_id, client_secret, redirect_uris } =
+    credentials.installed || credentials.web;
+
+  const oAuth2Client = new google.auth.OAuth2(
+    client_id,
+    client_secret,
+    redirect_uris?.[0] || "http://localhost"
+  );
+
+  oAuth2Client.setCredentials(token);
+  return google.drive({ version: "v3", auth: oAuth2Client });
+}
+
+const drive = createDriveClient();
+
+// Helpers Drive
 async function findOrCreateFolder(name, parentId) {
-  const safeName = String(name).replace(/'/g, "\\'");
-
+  const safeName = name.replace(/'/g, "\\'");
   const qParts = [
     `mimeType='application/vnd.google-apps.folder'`,
     `name='${safeName}'`,
@@ -87,22 +117,17 @@ async function findOrCreateFolder(name, parentId) {
     q: qParts.join(" and "),
     fields: "files(id,name)",
     spaces: "drive",
-    supportsAllDrives: true,
-    includeItemsFromAllDrives: true,
   });
 
-  if (list.data.files && list.data.files.length > 0) {
-    return list.data.files[0].id;
-  }
+  if (list.data.files?.length) return list.data.files[0].id;
 
   const created = await drive.files.create({
     requestBody: {
-      name: String(name),
+      name,
       mimeType: "application/vnd.google-apps.folder",
       parents: parentId ? [parentId] : undefined,
     },
     fields: "id",
-    supportsAllDrives: true,
   });
 
   return created.data.id;
@@ -122,39 +147,154 @@ async function uploadBase64ToDrive({ base64, mime, filename, parentId }) {
       body: stream,
     },
     fields: "id",
-    supportsAllDrives: true,
   });
 
   return created.data.id;
 }
 
-// --------------------- Rotas: Fotos (Drive) ---------------------
+// --------------------- URL ASSINADA (para <img>) ---------------------
+function signFileUrl(fileId, expiresAtMs) {
+  const payload = `${fileId}.${expiresAtMs}`;
+  const sig = crypto.createHmac("sha256", SIGNING_SECRET).update(payload).digest("hex");
+  return `${expiresAtMs}.${sig}`;
+}
 
-// POST /upload-foto
-// body: { codigoPosto, runId, itemId, mime, base64 }
+function verifySignedToken(fileId, token) {
+  if (!SIGNING_SECRET) return false;
+  if (!token) return false;
+
+  const [expStr, sig] = token.split(".");
+  const exp = Number(expStr);
+  if (!exp || !sig) return false;
+  if (Date.now() > exp) return false;
+
+  const payload = `${fileId}.${exp}`;
+  const expected = crypto.createHmac("sha256", SIGNING_SECRET).update(payload).digest("hex");
+
+  try {
+    return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
+  } catch {
+    return false;
+  }
+}
+
+// --------------------- Firebase Auth helpers ---------------------
+async function getUidFromAuthHeader(req) {
+  const authHeader = req.headers.authorization || "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+  if (!token) return null;
+
+  try {
+    const decoded = await admin.auth().verifyIdToken(token);
+    return decoded.uid;
+  } catch {
+    return null;
+  }
+}
+
+async function getPortalPerms(uid) {
+  const snap = await db.collection("usuarios").doc(uid).get();
+  if (!snap.exists) return { rolePortal: null, postosPermitidos: [] };
+  const data = snap.data() || {};
+  return {
+    rolePortal: data.rolePortal || null,
+    postosPermitidos: Array.isArray(data.postosPermitidos) ? data.postosPermitidos : [],
+  };
+}
+
+async function canAccessPosto(uid, codigoPosto) {
+  const { rolePortal, postosPermitidos } = await getPortalPerms(uid);
+  if (rolePortal === "super_admin") return true;
+  if (rolePortal === "admin" && postosPermitidos.includes(String(codigoPosto))) return true;
+  return false;
+}
+
+// --------------------- Portal: set-access (super_admin only) ---------------------
+app.post("/portal/set-access", async (req, res) => {
+  try {
+    const uidRequester = await getUidFromAuthHeader(req);
+    if (!uidRequester) return res.status(401).json({ error: "unauthorized" });
+
+    const perms = await getPortalPerms(uidRequester);
+    if (perms.rolePortal !== "super_admin") {
+      return res.status(403).json({ error: "forbidden" });
+    }
+
+    const { targetUid, rolePortal, postosPermitidos } = req.body;
+    if (!targetUid || !rolePortal) {
+      return res.status(400).json({ error: "faltando targetUid/rolePortal" });
+    }
+
+    await db.collection("usuarios").doc(String(targetUid)).update({
+      rolePortal: String(rolePortal),
+      postosPermitidos:
+        rolePortal === "super_admin"
+          ? []
+          : Array.isArray(postosPermitidos)
+          ? postosPermitidos.map(String)
+          : [],
+    });
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("portal/set-access error:", e);
+    return res.status(500).json({ error: "erro ao atualizar acesso" });
+  }
+});
+
+// --------------------- (Opcional) criar-posto protegido ---------------------
+// Se você NÃO usa mais, pode apagar.
+app.post("/criar-posto", async (req, res) => {
+  try {
+    const uidFromToken = await getUidFromAuthHeader(req);
+    if (!uidFromToken) return res.status(401).json({ error: "unauthorized" });
+
+    const { codigoPosto, nomePosto, uidCriador } = req.body;
+    if (!codigoPosto || !nomePosto || !uidCriador) {
+      return res.status(400).json({ error: "faltando codigoPosto/nomePosto/uidCriador" });
+    }
+
+    // só permite criar se o token for do próprio criador
+    if (String(uidCriador) !== String(uidFromToken)) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+
+    const postoRef = db.collection("postos").doc(String(codigoPosto));
+    const snap = await postoRef.get();
+
+    if (!snap.exists) {
+      await postoRef.set({
+        nome: String(nomePosto).trim(),
+        nomePosto: String(nomePosto).trim(),
+        codigoPosto: String(codigoPosto),
+        criadoEm: admin.firestore.FieldValue.serverTimestamp(),
+        criadoPorUid: String(uidCriador),
+      });
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("criar-posto error:", e);
+    return res.status(500).json({ error: "falha ao criar posto" });
+  }
+});
+
+// --------------------- Rotas CHECKLIST FOTO ---------------------
 app.post("/upload-foto", async (req, res) => {
   try {
-    const { codigoPosto, runId, itemId, mime, base64 } = req.body || {};
+    const { codigoPosto, runId, itemId, mime, base64 } = req.body;
 
     if (!codigoPosto || !runId || !itemId || !base64) {
-      return res
-        .status(400)
-        .json({ error: "Dados faltando (codigoPosto/runId/itemId/base64)" });
+      return res.status(400).json({ error: "Dados faltando (codigoPosto/runId/itemId/base64)" });
     }
 
     const rootId = process.env.DRIVE_ROOT_FOLDER_ID || null;
 
-    // Estrutura:
-    // {ROOT}/CHECKLISTS/{codigoPosto}/{runId}
     const baseFolder = await findOrCreateFolder("CHECKLISTS", rootId);
     const postoFolder = await findOrCreateFolder(String(codigoPosto), baseFolder);
     const runFolder = await findOrCreateFolder(String(runId), postoFolder);
 
-    const ext =
-      mime === "image/png" ? "png" :
-      mime === "image/webp" ? "webp" :
-      "jpg";
-
+    const ext = mime === "image/png" ? "png" : mime === "image/webp" ? "webp" : "jpg";
     const filename = `${itemId}_${Date.now()}.${ext}`;
 
     const fileId = await uploadBase64ToDrive({
@@ -164,6 +304,13 @@ app.post("/upload-foto", async (req, res) => {
       parentId: runFolder,
     });
 
+    await db.collection("driveFiles").doc(fileId).set({
+      codigoPosto: String(codigoPosto),
+      runId: String(runId),
+      itemId: String(itemId),
+      criadoEm: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
     return res.json({ fileId });
   } catch (e) {
     console.error("upload-foto error:", e?.message || e);
@@ -171,23 +318,34 @@ app.post("/upload-foto", async (req, res) => {
   }
 });
 
-// POST /signed-urls
-// body: { fileIds: string[] }
 app.post("/signed-urls", async (req, res) => {
   try {
-    const { fileIds } = req.body || {};
-    if (!Array.isArray(fileIds)) {
-      return res.status(400).json({ error: "fileIds inválido" });
+    const { fileIds } = req.body;
+    if (!Array.isArray(fileIds)) return res.status(400).json({ error: "fileIds inválido" });
+
+    if (!SIGNING_SECRET) {
+      return res.status(500).json({ error: "SIGNING_SECRET não configurado no backend" });
     }
 
-    const baseUrl =
-      process.env.PUBLIC_BASE_URL ||
-      `http://localhost:${process.env.PORT || 3000}`;
+    const uid = await getUidFromAuthHeader(req);
 
+    const expiresAt = Date.now() + 15 * 60 * 1000;
     const urls = {};
+
     for (const id of fileIds) {
       if (!id) continue;
-      urls[id] = `${baseUrl}/drive-file/${id}`;
+
+      // se vier auth, valida permissões do portal
+      if (uid) {
+        const metaSnap = await db.collection("driveFiles").doc(String(id)).get();
+        if (!metaSnap.exists) continue;
+        const meta = metaSnap.data();
+        const ok = await canAccessPosto(uid, meta?.codigoPosto);
+        if (!ok) continue;
+      }
+
+      const t = signFileUrl(String(id), expiresAt);
+      urls[id] = `${PUBLIC_BASE_URL}/drive-file/${id}?t=${encodeURIComponent(t)}`;
     }
 
     return res.json({ urls });
@@ -197,26 +355,20 @@ app.post("/signed-urls", async (req, res) => {
   }
 });
 
-// GET /drive-file/:id
-// Proxy do arquivo do Drive (imagem) sem login do cliente
 app.get("/drive-file/:id", async (req, res) => {
   try {
-    const fileId = req.params.id;
+    const fileId = String(req.params.id);
+    const token = String(req.query.t || "");
 
-    const meta = await drive.files.get({
-      fileId,
-      fields: "mimeType,name",
-      supportsAllDrives: true,
-    });
+    if (!SIGNING_SECRET) return res.status(500).send("SIGNING_SECRET missing");
+    if (!verifySignedToken(fileId, token)) return res.status(403).send("forbidden");
 
+    const meta = await drive.files.get({ fileId, fields: "mimeType,name" });
     const mimeType = meta.data.mimeType || "image/jpeg";
     res.setHeader("Content-Type", mimeType);
-    res.setHeader("Cache-Control", "public, max-age=86400");
+    res.setHeader("Cache-Control", "public, max-age=900");
 
-    const file = await drive.files.get(
-      { fileId, alt: "media", supportsAllDrives: true },
-      { responseType: "stream" }
-    );
+    const file = await drive.files.get({ fileId, alt: "media" }, { responseType: "stream" });
 
     file.data.on("error", (err) => {
       console.error("Drive stream error:", err);
@@ -231,15 +383,10 @@ app.get("/drive-file/:id", async (req, res) => {
 });
 
 // --------------------- Pagamento (MercadoPago) ---------------------
-
 app.post("/criar-pagamento", async (req, res) => {
   try {
-    const { plano, uid, email } = req.body || {};
-    if (!uid || !email || !plano) {
-      return res.status(400).json({ error: "Dados faltando" });
-    }
+    const { plano, uid, email } = req.body;
 
-    // valores (ajuste aqui)
     const planos = {
       mensal: { valor: 1.0, meses: 1, acessos: 1 },
       trimestral: { valor: 64.99, meses: 3, acessos: 1 },
@@ -249,47 +396,30 @@ app.post("/criar-pagamento", async (req, res) => {
 
     const p = planos[plano];
     if (!p) return res.status(400).json({ error: "Plano inválido" });
+    if (!uid || !email || !plano) return res.status(400).json({ error: "Dados faltando" });
 
     const preference = new Preference(client);
 
-    const notificationUrl = `${mustEnv("PUBLIC_BASE_URL")}/webhook/mercadopago`;
-
     const result = await preference.create({
       body: {
-        items: [
-          {
-            purpose: "wallet_purchase",
-            title: `Plano ${plano}`,
-            quantity: 1,
-            unit_price: p.valor,
-          },
-        ],
+        items: [{ purpose: "wallet_purchase", title: `Plano ${plano}`, quantity: 1, unit_price: p.valor }],
         payer: { email },
-        notification_url: notificationUrl,
+        notification_url: `${PUBLIC_BASE_URL}/webhook/mercadopago`,
         metadata: { uid, plano, meses: p.meses, acessos: p.acessos },
-        payment_methods: {
-          excluded_payment_types: [],
-          excluded_payment_methods: [],
-          installments: 1,
-        },
+        payment_methods: { excluded_payment_types: [], excluded_payment_methods: [], installments: 1 },
       },
     });
 
-    return res.json({ checkout_url: result.init_point });
+    res.json({ checkout_url: result.init_point });
   } catch (err) {
-    console.error("🔥 ERRO CRIAR PAGAMENTO:", err?.message || err);
-    return res.status(500).json({ error: "Erro ao criar pagamento" });
+    console.error("🔥 ERRO CRIAR PAGAMENTO:", err);
+    res.status(500).json({ error: "Erro ao criar pagamento" });
   }
 });
 
 app.post("/webhook/mercadopago", async (req, res) => {
   try {
-    console.log("🔔 WEBHOOK MP:", JSON.stringify(req.body, null, 2));
-
-    if (req.body?.topic === "merchant_order") {
-      console.log("ℹ️ merchant_order recebido, ignorando por enquanto");
-      return res.sendStatus(200);
-    }
+    if (req.body?.topic === "merchant_order") return res.sendStatus(200);
 
     const paymentId =
       req.body?.data?.id ||
@@ -300,40 +430,18 @@ app.post("/webhook/mercadopago", async (req, res) => {
     if (!paymentId) return res.sendStatus(200);
 
     const payment = new Payment(client);
+    const result = await payment.get({ id: paymentId });
 
-    let result;
-    try {
-      result = await payment.get({ id: paymentId });
-    } catch (err) {
-      console.log("⚠️ erro consultando pagamento:", err?.message || err);
-      return res.sendStatus(200);
-    }
-
-    if (result.status !== "approved") {
-      console.log("⚠️ Pagamento não aprovado:", paymentId, result.status);
-      return res.sendStatus(200);
-    }
+    if (result.status !== "approved") return res.sendStatus(200);
 
     const uid = result.metadata?.uid;
     const planoMeta = result.metadata?.plano;
-
-    if (!uid) {
-      console.log("❌ metadata.uid não veio no pagamento:", paymentId);
-      return res.sendStatus(200);
-    }
-
     const planoConfig = PLANOS[planoMeta];
-    if (!planoConfig) {
-      console.log("❌ Plano inválido no metadata:", planoMeta);
-      return res.sendStatus(200);
-    }
+    if (!uid || !planoConfig) return res.sendStatus(200);
 
     const userRef = db.collection("usuarios").doc(uid);
     const userSnap = await userRef.get();
-    if (!userSnap.exists) {
-      console.log("❌ Usuário não encontrado por UID:", uid);
-      return res.sendStatus(200);
-    }
+    if (!userSnap.exists) return res.sendStatus(200);
 
     const vencimento = new Date();
     vencimento.setMonth(vencimento.getMonth() + planoConfig.meses);
@@ -354,19 +462,20 @@ app.post("/webhook/mercadopago", async (req, res) => {
       },
     });
 
-    console.log("✅ PLANO LIBERADO UID:", uid, "PLANO:", planoConfig.plano);
     return res.sendStatus(200);
   } catch (err) {
-    console.error("🔥 ERRO WEBHOOK MP:", err?.message || err);
+    console.error("🔥 ERRO WEBHOOK MP:", err);
     return res.sendStatus(500);
   }
 });
 
-// --------------------- Healthcheck ---------------------
-app.get("/", (req, res) => {
-  res.json({ ok: true, service: "backend-checklist", ts: Date.now() });
+// Health
+app.get("/", (req, res) => res.send("OK"));
+
+app.get("/portal/ping", (req, res) => {
+  res.json({ ok: true, name: "portal-api" });
 });
 
-// --------------------- Start ---------------------
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Server rodando na porta ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`🚀 Server rodando na porta ${PORT}`);
+});
