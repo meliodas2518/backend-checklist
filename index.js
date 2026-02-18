@@ -50,8 +50,8 @@ app.use(
   })
 );
 
-// preflight sempre ok
-app.options("*", cors());
+// ✅ preflight sempre ok (Node 22/Express novo não aceita "*")
+app.options(/.*/, cors());
 
 // body
 app.use(express.json({ limit: "25mb" }));
@@ -278,7 +278,6 @@ app.post("/criar-posto", async (req, res) => {
       return res.status(400).json({ error: "faltando codigoPosto/nomePosto/uidCriador" });
     }
 
-    // só permite criar se o token for do próprio criador
     if (String(uidCriador) !== String(uidFromToken)) {
       return res.status(403).json({ error: "forbidden" });
     }
@@ -328,7 +327,6 @@ app.post("/upload-foto", async (req, res) => {
       parentId: runFolder,
     });
 
-    // meta para validar permissões e assinar com segurança
     await db.collection("driveFiles").doc(fileId).set({
       codigoPosto: String(codigoPosto),
       runId: String(runId),
@@ -360,7 +358,6 @@ app.post("/signed-urls", async (req, res) => {
     for (const id of fileIds) {
       if (!id) continue;
 
-      // se vier auth, valida permissões do portal
       if (uid) {
         const metaSnap = await db.collection("driveFiles").doc(String(id)).get();
         if (!metaSnap.exists) continue;
