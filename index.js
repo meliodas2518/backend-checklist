@@ -11,50 +11,24 @@ const fs = require("fs");
 const path = require("path");
 
 const app = express();
+app.use(
+  cors({
+    origin: ["http://localhost:3001"],
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+
+app.use(express.json({ limit: "25mb" }));
 
 // --------------------- ENV ---------------------
 const PORT = process.env.PORT || 3000;
-const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`).replace(
-  /\/+$/,
-  ""
-);
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
 const SIGNING_SECRET = process.env.SIGNING_SECRET;
 
 if (!SIGNING_SECRET) {
   console.warn("⚠️ SIGNING_SECRET não definido no .env (obrigatório para /drive-file assinado)");
 }
-
-// --------------------- CORS ---------------------
-const FRONTEND_ORIGINS = (process.env.FRONTEND_ORIGINS || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-
-const allowList = new Set([
-  "http://localhost:3000",
-  "http://localhost:3001",
-  ...FRONTEND_ORIGINS,
-]);
-
-app.use(
-  cors({
-    origin(origin, cb) {
-      // permite requests sem origin (curl/postman)
-      if (!origin) return cb(null, true);
-      if (allowList.has(origin)) return cb(null, true);
-      return cb(new Error(`CORS bloqueado para: ${origin}`), false);
-    },
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-    credentials: true,
-  })
-);
-
-// ✅ preflight sempre ok (Node 22/Express novo não aceita "*")
-app.options(/.*/, cors());
-
-// body
-app.use(express.json({ limit: "25mb" }));
 
 // --------------------- Firebase Admin ---------------------
 function loadServiceAccount() {
@@ -73,7 +47,6 @@ const serviceAccount = loadServiceAccount();
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
-
 const db = admin.firestore();
 
 // --------------------- Mercado Pago ---------------------
@@ -91,6 +64,7 @@ const PLANOS = {
 console.log("MP TOKEN:", process.env.MP_ACCESS_TOKEN ? "OK" : "FALTANDO");
 
 // --------------------- Google Drive (OAuth) ---------------------
+// Aceita JSON inline OU caminho de arquivo
 function readJsonFlexible(v) {
   if (!v) return null;
 
@@ -114,7 +88,8 @@ function createDriveClient() {
   const credentials = readJsonFlexible(credsVar);
   const token = readJsonFlexible(tokenVar);
 
-  const { client_id, client_secret, redirect_uris } = credentials.installed || credentials.web;
+  const { client_id, client_secret, redirect_uris } =
+    credentials.installed || credentials.web;
 
   const oAuth2Client = new google.auth.OAuth2(
     client_id,
@@ -128,7 +103,7 @@ function createDriveClient() {
 
 const drive = createDriveClient();
 
-// --------------------- Helpers Drive ---------------------
+// Helpers Drive
 async function findOrCreateFolder(name, parentId) {
   const safeName = name.replace(/'/g, "\\'");
   const qParts = [
@@ -268,6 +243,7 @@ app.post("/portal/set-access", async (req, res) => {
 });
 
 // --------------------- (Opcional) criar-posto protegido ---------------------
+// Se você NÃO usa mais, pode apagar.
 app.post("/criar-posto", async (req, res) => {
   try {
     const uidFromToken = await getUidFromAuthHeader(req);
@@ -278,6 +254,7 @@ app.post("/criar-posto", async (req, res) => {
       return res.status(400).json({ error: "faltando codigoPosto/nomePosto/uidCriador" });
     }
 
+    // só permite criar se o token for do próprio criador
     if (String(uidCriador) !== String(uidFromToken)) {
       return res.status(403).json({ error: "forbidden" });
     }
@@ -358,6 +335,7 @@ app.post("/signed-urls", async (req, res) => {
     for (const id of fileIds) {
       if (!id) continue;
 
+      // se vier auth, valida permissões do portal
       if (uid) {
         const metaSnap = await db.collection("driveFiles").doc(String(id)).get();
         if (!metaSnap.exists) continue;
@@ -424,22 +402,11 @@ app.post("/criar-pagamento", async (req, res) => {
 
     const result = await preference.create({
       body: {
-        items: [
-          {
-            purpose: "wallet_purchase",
-            title: `Plano ${plano}`,
-            quantity: 1,
-            unit_price: p.valor,
-          },
-        ],
+        items: [{ purpose: "wallet_purchase", title: `Plano ${plano}`, quantity: 1, unit_price: p.valor }],
         payer: { email },
         notification_url: `${PUBLIC_BASE_URL}/webhook/mercadopago`,
         metadata: { uid, plano, meses: p.meses, acessos: p.acessos },
-        payment_methods: {
-          excluded_payment_types: [],
-          excluded_payment_methods: [],
-          installments: 1,
-        },
+        payment_methods: { excluded_payment_types: [], excluded_payment_methods: [], installments: 1 },
       },
     });
 
@@ -502,13 +469,13 @@ app.post("/webhook/mercadopago", async (req, res) => {
   }
 });
 
-// --------------------- Health ---------------------
+// Health
 app.get("/", (req, res) => res.send("OK"));
+
 app.get("/portal/ping", (req, res) => {
   res.json({ ok: true, name: "portal-api" });
 });
 
-// --------------------- Listen ---------------------
 app.listen(PORT, () => {
   console.log(`🚀 Server rodando na porta ${PORT}`);
 });
