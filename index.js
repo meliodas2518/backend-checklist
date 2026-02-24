@@ -8,16 +8,36 @@ const { google } = require("googleapis");
 const { Readable } = require("stream");
 const fs = require("fs");
 const path = require("path");
+const multer = require("multer");
 
 const app = express();
+
+/**
+ * ✅ CORS
+ * - Em produção, o app (Expo Go) não precisa de CORS, mas seu Portal Web precisa.
+ * - Coloque seu domínio do portal aqui se quiser travar.
+ * - Como você usa Render e talvez Netlify, deixei permissivo com fallback.
+ */
 app.use(
   cors({
-    origin: ["http://localhost:3001"],
+    origin: [
+      "http://localhost:3001",
+      process.env.PORTAL_ORIGIN, // opcional
+      process.env.APP_ORIGIN, // opcional
+    ].filter(Boolean),
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
-app.use(express.json({ limit: "25mb" }));
+
+app.use(express.json({ limit: "25mb" })); // mantém base64 compatível (rota antiga)
+app.use(express.urlencoded({ extended: true })); // necessário p/ multipart
+
+// ✅ multer (upload rápido por multipart)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
+});
 
 const PORT = process.env.PORT || 3000;
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
@@ -126,6 +146,25 @@ async function uploadBase64ToDrive({ base64, mime, filename, parentId }) {
   return created.data.id;
 }
 
+// ✅ upload via buffer (multipart)
+async function uploadBufferToDrive({ buffer, mime, filename, parentId }) {
+  const stream = Readable.from(buffer);
+
+  const created = await drive.files.create({
+    requestBody: {
+      name: filename,
+      parents: parentId ? [parentId] : undefined,
+    },
+    media: {
+      mimeType: mime || "image/jpeg",
+      body: stream,
+    },
+    fields: "id",
+  });
+
+  return created.data.id;
+}
+
 // ---------- Assinatura URL ----------
 function signFileUrl(fileId, expiresAtMs) {
   const payload = `${fileId}.${expiresAtMs}`;
@@ -156,7 +195,11 @@ function verifySignedToken(fileId, token) {
 app.get("/", (req, res) => res.send("OK"));
 app.get("/portal/ping", (req, res) => res.json({ ok: true, name: "portal-api" }));
 
-// Upload foto (app)
+/**
+ * ✅ ROTA ANTIGA (base64)
+ * Mantive para compatibilidade.
+ * Se quiser mais rápido: use /upload-foto-multipart no app.
+ */
 app.post("/upload-foto", async (req, res) => {
   try {
     const { codigoPosto, runId, itemId, mime, base64 } = req.body;
@@ -182,7 +225,6 @@ app.post("/upload-foto", async (req, res) => {
       parentId: runFolder,
     });
 
-    // salva metadados (opcional, útil)
     await db.collection("driveFiles").doc(String(fileId)).set({
       codigoPosto: String(codigoPosto),
       runId: String(runId),
@@ -193,7 +235,57 @@ app.post("/upload-foto", async (req, res) => {
     return res.json({ fileId });
   } catch (e) {
     console.error("upload-foto error:", e);
-    return res.status(500).json({ error: "Falha ao fazer upload da foto" });
+    // ✅ mostra erro real no Render pra você diagnosticar mais fácil
+    return res.status(500).json({ error: e?.message || "Falha ao fazer upload da foto" });
+  }
+});
+
+/**
+ * ✅ ROTA NOVA (MULTIPART) - MUITO MAIS RÁPIDA
+ * No app, envie FormData com:
+ * - codigoPosto, runId, itemId
+ * - file (jpeg/png)
+ */
+app.post("/upload-foto-multipart", upload.single("file"), async (req, res) => {
+  try {
+    const { codigoPosto, runId, itemId } = req.body;
+    const file = req.file;
+
+    if (!codigoPosto || !runId || !itemId || !file) {
+      return res.status(400).json({ error: "faltando codigoPosto/runId/itemId/file" });
+    }
+
+    const rootId = process.env.DRIVE_ROOT_FOLDER_ID || null;
+
+    const baseFolder = await findOrCreateFolder("CHECKLISTS", rootId);
+    const postoFolder = await findOrCreateFolder(String(codigoPosto), baseFolder);
+    const runFolder = await findOrCreateFolder(String(runId), postoFolder);
+
+    const mime = file.mimetype || "image/jpeg";
+    const ext = mime === "image/png" ? "png" : mime === "image/webp" ? "webp" : "jpg";
+    const filename = `${itemId}_${Date.now()}.${ext}`;
+
+    const fileId = await uploadBufferToDrive({
+      buffer: file.buffer,
+      mime,
+      filename,
+      parentId: runFolder,
+    });
+
+    await db.collection("driveFiles").doc(String(fileId)).set({
+      codigoPosto: String(codigoPosto),
+      runId: String(runId),
+      itemId: String(itemId),
+      criadoEm: admin.firestore.FieldValue.serverTimestamp(),
+      originalName: file.originalname || null,
+      size: file.size || null,
+      mime,
+    });
+
+    return res.json({ fileId });
+  } catch (e) {
+    console.error("upload-foto-multipart error:", e);
+    return res.status(500).json({ error: e?.message || "Falha ao fazer upload da foto" });
   }
 });
 
@@ -216,7 +308,7 @@ app.post("/signed-urls", async (req, res) => {
     return res.json({ urls });
   } catch (e) {
     console.error("signed-urls error:", e);
-    return res.status(500).json({ error: "Falha ao gerar urls" });
+    return res.status(500).json({ error: e?.message || "Falha ao gerar urls" });
   }
 });
 
