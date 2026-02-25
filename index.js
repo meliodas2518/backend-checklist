@@ -9,7 +9,7 @@ const { Readable } = require("stream");
 const fs = require("fs");
 const path = require("path");
 const multer = require("multer");
-
+const { MercadoPagoConfig, Preference, Payment } = require("mercadopago");
 const app = express();
 
 /**
@@ -195,6 +195,178 @@ function verifySignedToken(fileId, token) {
 app.get("/", (req, res) => res.send("OK"));
 app.get("/portal/ping", (req, res) => res.json({ ok: true, name: "portal-api" }));
 
+// ---------- Mercado Pago ----------
+const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
+if (!MP_ACCESS_TOKEN) {
+  console.warn("⚠️ MP_ACCESS_TOKEN não definido (Mercado Pago desativado)");
+}
+
+const mpClient = MP_ACCESS_TOKEN
+  ? new MercadoPagoConfig({ accessToken: MP_ACCESS_TOKEN })
+  : null;
+
+function mustHaveMP(req, res) {
+  if (!mpClient) {
+    res.status(500).json({ error: "MP_ACCESS_TOKEN não configurado no backend." });
+    return false;
+  }
+  return true;
+}
+
+/**
+ * ✅ Criar preferência (gera link de pagamento)
+ * Body esperado:
+ * {
+ *   uid: "uid do usuário",
+ *   plano: "mensal" | "anual",
+ *   email: "email do pagador",
+ *   nomePosto: "..."
+ * }
+ */
+app.post("/mp/create-preference", async (req, res) => {
+  try {
+    if (!mustHaveMP(req, res)) return;
+
+    const { uid, plano, email, nomePosto } = req.body || {};
+    if (!uid || !plano) {
+      return res.status(400).json({ error: "faltando uid/plano" });
+    }
+
+    const price =
+      plano === "anual" ? 99.9 :
+      plano === "mensal" ? 29.9 :
+      null;
+
+    if (!price) return res.status(400).json({ error: "plano inválido" });
+
+    const preference = new Preference(mpClient);
+
+    const notification_url = `${PUBLIC_BASE_URL}/mp/webhook`;
+
+    const result = await preference.create({
+      body: {
+        items: [
+          {
+            title: `Plano ${plano} - Análise de Combustível`,
+            quantity: 1,
+            currency_id: "BRL",
+            unit_price: Number(price),
+          },
+        ],
+        payer: email ? { email } : undefined,
+        metadata: {
+          uid: String(uid),
+          plano: String(plano),
+          nomePosto: nomePosto ? String(nomePosto) : "",
+        },
+        notification_url,
+        // opcional: se quiser redirecionar
+        // back_urls: {
+        //   success: "https://seu-portal.netlify.app/sucesso",
+        //   failure: "https://seu-portal.netlify.app/erro",
+        // },
+        // auto_return: "approved",
+      },
+    });
+
+    return res.json({
+      id: result.id,
+      init_point: result.init_point,
+      sandbox_init_point: result.sandbox_init_point,
+    });
+  } catch (e) {
+    console.error("mp/create-preference error:", e);
+    return res.status(500).json({ error: e?.message || "Falha ao criar preferência" });
+  }
+});
+
+/**
+ * ✅ Webhook do Mercado Pago
+ * O MP manda: ?type=payment&data.id=xxxx (ou em body dependendo do modo)
+ */
+app.post("/mp/webhook", async (req, res) => {
+  try {
+    if (!mustHaveMP(req, res)) return;
+
+    const type = req.query.type || req.body?.type;
+    const dataId = req.query["data.id"] || req.body?.data?.id;
+
+    // Sempre responde 200 rápido pro MP não ficar reenviando
+    res.sendStatus(200);
+
+    if (type !== "payment" || !dataId) return;
+
+    const paymentApi = new Payment(mpClient);
+    const pay = await paymentApi.get({ id: String(dataId) });
+
+    const status = pay?.status; // approved, rejected, pending...
+    const metadata = pay?.metadata || {};
+    const uid = metadata?.uid;
+    const plano = metadata?.plano;
+
+    if (!uid) {
+      console.log("mp/webhook: pagamento sem uid no metadata", dataId);
+      return;
+    }
+
+    // ✅ Atualiza Firestore via Admin SDK (não depende de rules)
+    const userRef = db.collection("usuarios").doc(String(uid));
+
+    // regras do plano (ajuste como você quiser)
+    const now = new Date();
+    const venc = new Date(now);
+    if (plano === "anual") venc.setFullYear(venc.getFullYear() + 1);
+    else venc.setMonth(venc.getMonth() + 1);
+
+    const patch = {
+      pagamento: {
+        gateway: "MERCADO_PAGO",
+        paymentId: String(dataId),
+        status: String(status || ""),
+        atualizadoEm: admin.firestore.FieldValue.serverTimestamp(),
+      },
+    };
+
+    if (status === "approved") {
+      patch.autorizado = true;
+      patch.plano = plano || "mensal";
+      patch.vencimento = venc;
+      patch.acessosPermitidos = 1;
+    }
+
+    await userRef.set(patch, { merge: true });
+
+    console.log("mp/webhook ok:", dataId, status, uid);
+  } catch (e) {
+    console.error("mp/webhook error:", e);
+    // não responde aqui porque já respondemos 200
+  }
+});
+
+/**
+ * ✅ Consultar status manual (debug)
+ * GET /mp/payment-status/:id
+ */
+app.get("/mp/payment-status/:id", async (req, res) => {
+  try {
+    if (!mustHaveMP(req, res)) return;
+
+    const paymentApi = new Payment(mpClient);
+    const pay = await paymentApi.get({ id: String(req.params.id) });
+
+    return res.json({
+      id: pay.id,
+      status: pay.status,
+      status_detail: pay.status_detail,
+      metadata: pay.metadata,
+      payer: pay.payer?.email,
+      transaction_amount: pay.transaction_amount,
+    });
+  } catch (e) {
+    console.error("mp/payment-status error:", e);
+    return res.status(500).json({ error: e?.message || "Falha ao consultar pagamento" });
+  }
+});
 /**
  * ✅ ROTA ANTIGA (base64)
  * Mantive para compatibilidade.
