@@ -21,7 +21,7 @@ const app = express();
 app.use(
   cors({
     origin: [
-      "http://localhost:3001",
+      "https://portalchecklist.netlify.app",
       process.env.PORTAL_ORIGIN, // opcional
       process.env.APP_ORIGIN, // opcional
     ].filter(Boolean),
