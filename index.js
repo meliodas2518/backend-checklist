@@ -212,13 +212,27 @@ function mustHaveMP(req, res) {
   }
   return true;
 }
+// ✅ TABELA DE PLANOS (UI + BACKEND)
+const PLANS = {
+  mensal:     { label: "Mensal",      price: 24.99, months: 1,  acessos: 1 },
+  trimestral: { label: "Trimestral",  price: 64.99, months: 3,  acessos: 1 },
+  anual:      { label: "Anual",       price: 149.99, months: 12, acessos: 1 },
+  anual_plus: { label: "Anual Plus",  price: 189.99, months: 12, acessos: 2 },
+};
 
+function calcVencimentoByPlano(planoKey) {
+  const cfg = PLANS[String(planoKey)] || PLANS.mensal;
+  const now = new Date();
+  const venc = new Date(now);
+  venc.setMonth(venc.getMonth() + Number(cfg.months || 1));
+  return { venc, cfg };
+}
 /**
  * ✅ Criar preferência (gera link de pagamento)
  * Body esperado:
  * {
  *   uid: "uid do usuário",
- *   plano: "mensal" | "anual",
+ *   plano: "mensal" | "trimestral" | "anual" | "anual_plus",
  *   email: "email do pagador",
  *   nomePosto: "..."
  * }
@@ -232,40 +246,29 @@ app.post("/mp/create-preference", async (req, res) => {
       return res.status(400).json({ error: "faltando uid/plano" });
     }
 
-    const price =
-      plano === "anual" ? 99.9 :
-      plano === "mensal" ? 29.9 :
-      null;
-
-    if (!price) return res.status(400).json({ error: "plano inválido" });
+    const plan = PLANS[String(plano)];
+    if (!plan) return res.status(400).json({ error: "plano inválido" });
 
     const preference = new Preference(mpClient);
-
     const notification_url = `${PUBLIC_BASE_URL}/mp/webhook`;
 
     const result = await preference.create({
       body: {
         items: [
           {
-            title: `Plano ${plano} - Análise de Combustível`,
+            title: `Plano ${plan.label} - Análise de Combustível`,
             quantity: 1,
             currency_id: "BRL",
-            unit_price: Number(price),
+            unit_price: Number(plan.price),
           },
         ],
-        payer: email ? { email } : undefined,
+        payer: email ? { email: String(email) } : undefined,
         metadata: {
           uid: String(uid),
           plano: String(plano),
           nomePosto: nomePosto ? String(nomePosto) : "",
         },
         notification_url,
-        // opcional: se quiser redirecionar
-        // back_urls: {
-        //   success: "https://seu-portal.netlify.app/sucesso",
-        //   failure: "https://seu-portal.netlify.app/erro",
-        // },
-        // auto_return: "approved",
       },
     });
 
@@ -312,11 +315,7 @@ app.post("/mp/webhook", async (req, res) => {
     // ✅ Atualiza Firestore via Admin SDK (não depende de rules)
     const userRef = db.collection("usuarios").doc(String(uid));
 
-    // regras do plano (ajuste como você quiser)
-    const now = new Date();
-    const venc = new Date(now);
-    if (plano === "anual") venc.setFullYear(venc.getFullYear() + 1);
-    else venc.setMonth(venc.getMonth() + 1);
+    const { venc, cfg } = calcVencimentoByPlano(plano);
 
     const patch = {
       pagamento: {
@@ -329,14 +328,14 @@ app.post("/mp/webhook", async (req, res) => {
 
     if (status === "approved") {
       patch.autorizado = true;
-      patch.plano = plano || "mensal";
+      patch.plano = String(plano || "mensal");
       patch.vencimento = venc;
-      patch.acessosPermitidos = 1;
+      patch.acessosPermitidos = Number(cfg.acessos || 1);
     }
 
     await userRef.set(patch, { merge: true });
 
-    console.log("mp/webhook ok:", dataId, status, uid);
+    console.log("mp/webhook ok:", dataId, status, uid, plano);
   } catch (e) {
     console.error("mp/webhook error:", e);
     // não responde aqui porque já respondemos 200
