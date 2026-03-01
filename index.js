@@ -195,6 +195,55 @@ function verifySignedToken(fileId, token) {
 app.get("/", (req, res) => res.send("OK"));
 app.get("/portal/ping", (req, res) => res.json({ ok: true, name: "portal-api" }));
 
+async function requireFirebaseAuth(req, res, next) {
+  try {
+    const h = req.headers.authorization || "";
+    const token = h.startsWith("Bearer ") ? h.slice(7) : null;
+    if (!token) return res.status(401).json({ error: "missing token" });
+
+    const decoded = await admin.auth().verifyIdToken(token);
+    req.user = decoded;
+    next();
+  } catch (e) {
+    return res.status(401).json({ error: "invalid token" });
+  }
+}
+
+async function requireSuperAdmin(req, res, next) {
+  try {
+    const uid = req.user?.uid;
+    const snap = await db.collection("usuarios").doc(uid).get();
+    const role = snap.exists ? snap.data()?.rolePortal : null;
+    if (role !== "super_admin") return res.status(403).json({ error: "only super_admin" });
+    next();
+  } catch (e) {
+    return res.status(500).json({ error: "role check failed" });
+  }
+}
+
+app.post("/portal/set-access", requireFirebaseAuth, requireSuperAdmin, async (req, res) => {
+  try {
+    const { targetUid, rolePortal, postosPermitidos } = req.body || {};
+
+    if (!targetUid) return res.status(400).json({ error: "targetUid obrigatório" });
+    if (!rolePortal || !["admin", "super_admin"].includes(String(rolePortal)))
+      return res.status(400).json({ error: "rolePortal inválido" });
+
+    const lista = Array.isArray(postosPermitidos) ? postosPermitidos.map(String) : [];
+
+    const patch = {
+      rolePortal: String(rolePortal),
+      postosPermitidos: rolePortal === "super_admin" ? [] : lista,
+      atualizadoEm: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    await db.collection("usuarios").doc(String(targetUid)).set(patch, { merge: true });
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("set-access error:", e);
+    return res.status(500).json({ error: e?.message || "Falha ao atualizar acesso" });
+  }
+});
 // ---------- Mercado Pago ----------
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
 if (!MP_ACCESS_TOKEN) {
