@@ -208,6 +208,79 @@ async function requireFirebaseAuth(req, res, next) {
     return res.status(401).json({ error: "invalid token" });
   }
 }
+// ===============================
+// Telegram (ENV)
+// ===============================
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+
+async function sendTelegram(text) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+    console.warn("⚠️ TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID não configurados");
+    return { ok: false, skipped: true };
+  }
+
+  const resp = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: String(TELEGRAM_CHAT_ID),
+      text: String(text || ""),
+    }),
+  });
+
+  if (!resp.ok) {
+    const json = await resp.json().catch(() => null);
+    console.log("telegram sendMessage erro:", resp.status, json);
+    return { ok: false, status: resp.status, json };
+  }
+
+  return { ok: true };
+}
+
+// ===============================
+// ✅ App -> avisa "novo cadastro" (seguro)
+// ===============================
+app.post("/app/telegram/new-user", requireFirebaseAuth, async (req, res) => {
+  try {
+    const uid = req.user?.uid;
+    if (!uid) return res.status(401).json({ error: "unauthorized" });
+
+    // opcional: aceitar override do device vindo do app
+    const deviceFromApp = req.body?.deviceName ? String(req.body.deviceName) : "";
+
+    // lê dados do perfil pelo Admin SDK
+    const snap = await db.collection("usuarios").doc(String(uid)).get();
+    if (!snap.exists) return res.status(404).json({ error: "perfil nao encontrado" });
+
+    const u = snap.data() || {};
+    const email = String(u.email || req.user?.email || "");
+    const nomePosto = String(u.nomePosto || "");
+    const codigoPosto = String(u.codigoPosto || "");
+    const telefone = String(u.telefone || "");
+
+    const device =
+      deviceFromApp ||
+      String(u.deviceNameAtual1 || u.deviceName1 || "");
+
+    // ✅ manda telegram
+    const text =
+      `👤 NOVO CADASTRO (APP)\n` +
+      `📧 Email: ${email}\n` +
+      `🆔 UID: ${uid}\n` +
+      `📱 Device: ${device || "—"}\n` +
+      `📞 Telefone: ${telefone || "—"}\n` +
+      `🏪 Posto: ${nomePosto || "—"}\n` +
+      `🏷 Código: ${codigoPosto || "—"}`;
+
+    await sendTelegram(text);
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("/app/telegram/new-user error:", e);
+    return res.status(500).json({ error: e?.message || "falha ao enviar telegram" });
+  }
+});
 
 async function requireSuperAdmin(req, res, next) {
   try {
@@ -242,6 +315,71 @@ app.post("/portal/set-access", requireFirebaseAuth, requireSuperAdmin, async (re
   } catch (e) {
     console.error("set-access error:", e);
     return res.status(500).json({ error: e?.message || "Falha ao atualizar acesso" });
+  }
+});
+// ================================
+// ✅ TELEGRAM - PRIMEIRO LOGIN 1x
+// ================================
+
+async function sendTelegram(text) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return; // não quebra se não configurar
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+  await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: String(TELEGRAM_CHAT_ID), text: String(text) }),
+  }).catch(() => {});
+}
+
+// Auth: você já tem requireFirebaseAuth
+
+app.post("/notify-first-login", requireFirebaseAuth, async (req, res) => {
+  try {
+    const uid = String(req.user?.uid || "");
+    if (!uid) return res.status(400).json({ error: "uid ausente" });
+
+    const userRef = db.collection("usuarios").doc(uid);
+
+    const result = await db.runTransaction(async (tx) => {
+      const snap = await tx.get(userRef);
+      if (!snap.exists) return { ok: false, reason: "perfil_nao_existe" };
+
+      const data = snap.data() || {};
+      if (data.primeiroLoginNotificadoEm) {
+        return { ok: true, sent: false, data };
+      }
+
+      tx.set(
+        userRef,
+        { primeiroLoginNotificadoEm: admin.firestore.FieldValue.serverTimestamp() },
+        { merge: true }
+      );
+
+      return { ok: true, sent: true, data };
+    });
+
+    if (!result.ok) return res.status(400).json(result);
+
+    if (result.sent) {
+      const d = result.data || {};
+      const email = req.user?.email || d.email || "-";
+      const codigoPosto = d.codigoPosto || "-";
+      const nomePosto = d.nomePosto || "-";
+
+      const text =
+        `✅ PRIMEIRO LOGIN (APP NOVO)\n` +
+        `📧 Email: ${email}\n` +
+        `🆔 UID: ${uid}\n` +
+        `🏪 Posto: ${nomePosto} (${codigoPosto})\n` +
+        `🕒 ${new Date().toISOString()}`;
+
+      await sendTelegram(text);
+    }
+
+    return res.json({ ok: true, sent: !!result.sent });
+  } catch (e) {
+    console.error("notify-first-login error:", e);
+    return res.status(500).json({ error: e?.message || "Falha" });
   }
 });
 // ---------- Mercado Pago ----------
