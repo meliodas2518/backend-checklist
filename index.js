@@ -62,7 +62,7 @@ admin.initializeApp({
 });
 const db = admin.firestore();
 
-// ---------- Google Drive (OAuth) ----------
+// ---------- Google Drive (Service Account) ----------
 function readJsonFlexible(v) {
   if (!v) return null;
   const trimmed = String(v).trim();
@@ -73,27 +73,17 @@ function readJsonFlexible(v) {
 }
 
 function createDriveClient() {
-  const credsVar = process.env.DRIVE_OAUTH_CREDENTIALS_JSON;
-  const tokenVar = process.env.DRIVE_OAUTH_TOKEN_JSON;
+  const saVar = process.env.DRIVE_SERVICE_ACCOUNT_JSON;
+  if (!saVar) throw new Error("Faltando DRIVE_SERVICE_ACCOUNT_JSON");
 
-  if (!credsVar || !tokenVar) {
-    throw new Error("Faltando DRIVE_OAUTH_CREDENTIALS_JSON ou DRIVE_OAUTH_TOKEN_JSON");
-  }
+  const serviceAccount = readJsonFlexible(saVar);
 
-  const credentials = readJsonFlexible(credsVar);
-  const token = readJsonFlexible(tokenVar);
+  const auth = new google.auth.GoogleAuth({
+    credentials: serviceAccount,
+    scopes: ["https://www.googleapis.com/auth/drive"],
+  });
 
-  const { client_id, client_secret, redirect_uris } =
-    credentials.installed || credentials.web;
-
-  const oAuth2Client = new google.auth.OAuth2(
-    client_id,
-    client_secret,
-    redirect_uris?.[0] || "http://localhost"
-  );
-
-  oAuth2Client.setCredentials(token);
-  return google.drive({ version: "v3", auth: oAuth2Client });
+  return google.drive({ version: "v3", auth });
 }
 
 const drive = createDriveClient();
