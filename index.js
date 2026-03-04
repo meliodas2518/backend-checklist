@@ -72,6 +72,16 @@ function readJsonFlexible(v) {
   return JSON.parse(fs.readFileSync(abs, "utf8"));
 }
 
+function getDriveRootFolderIdOrThrow() {
+  const id = String(process.env.DRIVE_ROOT_FOLDER_ID || "").trim();
+  if (!id) {
+    throw new Error(
+      "DRIVE_ROOT_FOLDER_ID não definido no ambiente. Sem isso, o upload cai no Drive da service account e dá 'no storage quota'."
+    );
+  }
+  return id;
+}
+
 function createDriveClient() {
   const saVar = process.env.DRIVE_SERVICE_ACCOUNT_JSON;
   if (!saVar) throw new Error("Faltando DRIVE_SERVICE_ACCOUNT_JSON");
@@ -88,19 +98,48 @@ function createDriveClient() {
 
 const drive = createDriveClient();
 
+async function assertDriveRootAccessible() {
+  const rootId = getDriveRootFolderIdOrThrow();
+
+  // valida se a service account enxerga a pasta
+  const meta = await drive.files.get({
+    fileId: rootId,
+    fields: "id,name,mimeType,capabilities",
+    supportsAllDrives: true,
+  });
+
+  const canAdd = meta?.data?.capabilities?.canAddChildren;
+  if (!canAdd) {
+    throw new Error(
+      `A service account NÃO tem permissão de escrever na pasta (${rootId}). Compartilhe a pasta com permissão de EDITOR para o client_email da service account.`
+    );
+  }
+
+  console.log("✅ Drive root OK:", meta.data?.name, rootId);
+}
+
+// Rode uma verificação no start (não derruba o server, mas loga erro claro)
+assertDriveRootAccessible().catch((e) => {
+  console.error("❌ Drive root access error:", e?.message || e);
+});
+
 async function findOrCreateFolder(name, parentId) {
+  if (!parentId) throw new Error("parentId ausente em findOrCreateFolder (isso causaria quota error).");
+
   const safeName = name.replace(/'/g, "\\'");
   const qParts = [
     `mimeType='application/vnd.google-apps.folder'`,
     `name='${safeName}'`,
     `trashed=false`,
+    `'${parentId}' in parents`,
   ];
-  if (parentId) qParts.push(`'${parentId}' in parents`);
 
   const list = await drive.files.list({
     q: qParts.join(" and "),
     fields: "files(id,name)",
     spaces: "drive",
+    includeItemsFromAllDrives: true,
+    supportsAllDrives: true,
   });
 
   if (list.data.files?.length) return list.data.files[0].id;
@@ -109,47 +148,53 @@ async function findOrCreateFolder(name, parentId) {
     requestBody: {
       name,
       mimeType: "application/vnd.google-apps.folder",
-      parents: parentId ? [parentId] : undefined,
+      parents: [parentId],
     },
     fields: "id",
+    supportsAllDrives: true,
+  });
+
+  return created.data.id;
+}
+
+async function uploadBufferToDrive({ buffer, mime, filename, parentId }) {
+  if (!parentId) throw new Error("parentId ausente em uploadBufferToDrive (isso causaria quota error).");
+
+  const stream = Readable.from(buffer);
+
+  const created = await drive.files.create({
+    requestBody: {
+      name: filename,
+      parents: [parentId],
+    },
+    media: {
+      mimeType: mime || "image/jpeg",
+      body: stream,
+    },
+    fields: "id",
+    supportsAllDrives: true,
   });
 
   return created.data.id;
 }
 
 async function uploadBase64ToDrive({ base64, mime, filename, parentId }) {
+  if (!parentId) throw new Error("parentId ausente em uploadBase64ToDrive (isso causaria quota error).");
+
   const buffer = Buffer.from(base64, "base64");
   const stream = Readable.from(buffer);
 
   const created = await drive.files.create({
     requestBody: {
       name: filename,
-      parents: parentId ? [parentId] : undefined,
+      parents: [parentId],
     },
     media: {
       mimeType: mime || "image/jpeg",
       body: stream,
     },
     fields: "id",
-  });
-
-  return created.data.id;
-}
-
-// ✅ upload via buffer (multipart)
-async function uploadBufferToDrive({ buffer, mime, filename, parentId }) {
-  const stream = Readable.from(buffer);
-
-  const created = await drive.files.create({
-    requestBody: {
-      name: filename,
-      parents: parentId ? [parentId] : undefined,
-    },
-    media: {
-      mimeType: mime || "image/jpeg",
-      body: stream,
-    },
-    fields: "id",
+    supportsAllDrives: true,
   });
 
   return created.data.id;
@@ -556,9 +601,9 @@ app.post("/upload-foto", async (req, res) => {
       return res.status(400).json({ error: "faltando codigoPosto/runId/itemId/base64" });
     }
 
-    const rootId = process.env.DRIVE_ROOT_FOLDER_ID || null;
+    const rootId = getDriveRootFolderIdOrThrow();
 
-    // CHECKLISTS/{codigoPosto}/{runId}/arquivo.jpg
+    // Estrutura: {ROOT}/CHECKLISTS/{codigoPosto}/{runId}/arquivo.jpg
     const baseFolder = await findOrCreateFolder("CHECKLISTS", rootId);
     const postoFolder = await findOrCreateFolder(String(codigoPosto), baseFolder);
     const runFolder = await findOrCreateFolder(String(runId), postoFolder);
@@ -578,16 +623,15 @@ app.post("/upload-foto", async (req, res) => {
       runId: String(runId),
       itemId: String(itemId),
       criadoEm: admin.firestore.FieldValue.serverTimestamp(),
+      mime: mime || "image/jpeg",
     });
 
     return res.json({ fileId });
   } catch (e) {
     console.error("upload-foto error:", e);
-    // ✅ mostra erro real no Render pra você diagnosticar mais fácil
     return res.status(500).json({ error: e?.message || "Falha ao fazer upload da foto" });
   }
 });
-
 /**
  * ✅ ROTA NOVA (MULTIPART) - MUITO MAIS RÁPIDA
  * No app, envie FormData com:
@@ -603,7 +647,7 @@ app.post("/upload-foto-multipart", upload.single("file"), async (req, res) => {
       return res.status(400).json({ error: "faltando codigoPosto/runId/itemId/file" });
     }
 
-    const rootId = process.env.DRIVE_ROOT_FOLDER_ID || null;
+    const rootId = getDriveRootFolderIdOrThrow();
 
     const baseFolder = await findOrCreateFolder("CHECKLISTS", rootId);
     const postoFolder = await findOrCreateFolder(String(codigoPosto), baseFolder);
