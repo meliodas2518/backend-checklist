@@ -123,26 +123,36 @@ assertDriveRootAccessible().catch((e) => {
   console.error("❌ Drive root access error:", e?.message || e);
 });
 
+const folderCache = new Map();
+
 async function findOrCreateFolder(name, parentId) {
-  if (!parentId) throw new Error("parentId ausente em findOrCreateFolder (isso causaria quota error).");
+
+  const cacheKey = `${parentId}_${name}`;
+
+  if (folderCache.has(cacheKey)) {
+    return folderCache.get(cacheKey);
+  }
 
   const safeName = name.replace(/'/g, "\\'");
-  const qParts = [
-    `mimeType='application/vnd.google-apps.folder'`,
-    `name='${safeName}'`,
-    `trashed=false`,
-    `'${parentId}' in parents`,
-  ];
 
   const list = await drive.files.list({
-    q: qParts.join(" and "),
+    q: `
+      mimeType='application/vnd.google-apps.folder'
+      and name='${safeName}'
+      and trashed=false
+      and '${parentId}' in parents
+    `,
     fields: "files(id,name)",
     spaces: "drive",
     includeItemsFromAllDrives: true,
-    supportsAllDrives: true,
+    supportsAllDrives: true
   });
 
-  if (list.data.files?.length) return list.data.files[0].id;
+  if (list.data.files.length > 0) {
+    const id = list.data.files[0].id;
+    folderCache.set(cacheKey, id);
+    return id;
+  }
 
   const created = await drive.files.create({
     requestBody: {
@@ -151,33 +161,35 @@ async function findOrCreateFolder(name, parentId) {
       parents: [parentId],
     },
     fields: "id",
-    supportsAllDrives: true,
+    supportsAllDrives: true
   });
 
-  return created.data.id;
+  const id = created.data.id;
+
+  folderCache.set(cacheKey, id);
+
+  return id;
 }
 
 async function uploadBufferToDrive({ buffer, mime, filename, parentId }) {
-  if (!parentId) throw new Error("parentId ausente em uploadBufferToDrive (isso causaria quota error).");
 
   const stream = Readable.from(buffer);
 
   const created = await drive.files.create({
     requestBody: {
       name: filename,
-      parents: [parentId],
+      parents: [parentId]
     },
     media: {
-      mimeType: mime || "image/jpeg",
-      body: stream,
+      mimeType: mime,
+      body: stream
     },
     fields: "id",
-    supportsAllDrives: true,
+    supportsAllDrives: true
   });
 
   return created.data.id;
 }
-
 async function uploadBase64ToDrive({ base64, mime, filename, parentId }) {
   if (!parentId) throw new Error("parentId ausente em uploadBase64ToDrive (isso causaria quota error).");
 
@@ -640,7 +652,7 @@ app.post("/upload-foto", async (req, res) => {
  */
 app.post("/upload-foto-multipart", upload.single("file"), async (req, res) => {
   try {
-
+    const start = Date.now();
     console.log("UPLOAD MULTIPART HIT", {
       codigoPosto: req.body?.codigoPosto,
       runId: req.body?.runId,
