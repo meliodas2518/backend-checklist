@@ -1,5 +1,3 @@
-import { ok } from "assert";
-
 // backend/index.js
 require("dotenv").config();
 const express = require("express");
@@ -640,9 +638,16 @@ app.post("/upload-foto", async (req, res) => {
  * - codigoPosto, runId, itemId
  * - file (jpeg/png)
  */
-console.log("UPLOAD MULTIPART HIT", {codigoPosto: req.body?.codigoPosto, runId: req.body?.runId, itemId: req.body?.itemId, hasFile: !!req.file});
 app.post("/upload-foto-multipart", upload.single("file"), async (req, res) => {
   try {
+
+    console.log("UPLOAD MULTIPART HIT", {
+      codigoPosto: req.body?.codigoPosto,
+      runId: req.body?.runId,
+      itemId: req.body?.itemId,
+      hasFile: !!req.file
+    });
+
     const { codigoPosto, runId, itemId } = req.body;
     const file = req.file;
 
@@ -678,6 +683,7 @@ app.post("/upload-foto-multipart", upload.single("file"), async (req, res) => {
     });
 
     return res.json({ fileId });
+
   } catch (e) {
     console.error("upload-foto-multipart error:", e);
     return res.status(500).json({ error: e?.message || "Falha ao fazer upload da foto" });
