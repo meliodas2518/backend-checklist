@@ -90,7 +90,9 @@ function createDriveClient() {
 
   const auth = new google.auth.GoogleAuth({
     credentials: serviceAccount,
-    scopes: ["https://www.googleapis.com/auth/drive"],
+    scopes: ["https://www.googleapis.com/auth/drive",
+      "https://www.googleapis.com/auth/drive.file"
+    ],
   });
 
   return google.drive({ version: "v3", auth });
@@ -156,12 +158,16 @@ async function findOrCreateFolder(name, parentId) {
 
   const created = await drive.files.create({
     requestBody: {
-      name,
-      mimeType: "application/vnd.google-apps.folder",
+      name: filename,
       parents: [parentId],
     },
+    media: {
+      mimeType: mime,      
+      body: stream,
+    },
     fields: "id",
-    supportsAllDrives: true
+    supportsAllDrives: true,
+    includeItemsFromAllDrives: true,
   });
 
   const id = created.data.id;
