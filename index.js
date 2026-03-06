@@ -1,5 +1,6 @@
 // backend/index.js
 require("dotenv").config();
+
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
@@ -10,14 +11,12 @@ const fs = require("fs");
 const path = require("path");
 const multer = require("multer");
 const { MercadoPagoConfig, Preference, Payment } = require("mercadopago");
+
 const app = express();
 
-/**
- * ✅ CORS
- * - Em produção, o app (Expo Go) não precisa de CORS, mas seu Portal Web precisa.
- * - Coloque seu domínio do portal aqui se quiser travar.
- * - Como você usa Render e talvez Netlify, deixei permissivo com fallback.
- */
+// ===============================
+// CORS
+// ===============================
 app.use(
   cors({
     origin: [
@@ -30,10 +29,10 @@ app.use(
   })
 );
 
-app.use(express.json({ limit: "25mb" })); // mantém base64 compatível (rota antiga)
-app.use(express.urlencoded({ extended: true })); // necessário p/ multipart
+app.use(express.json({ limit: "25mb" }));
+app.use(express.urlencoded({ extended: true }));
 
-// ✅ multer (upload rápido por multipart)
+// multer (upload por multipart)
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
@@ -41,20 +40,22 @@ const upload = multer({
 
 const PORT = process.env.PORT || 3000;
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
-const SIGNING_SECRET = process.env.SIGNING_SECRET;
+const SIGNING_SECRET = String(process.env.SIGNING_SECRET || "").trim();
 
 if (!SIGNING_SECRET) {
-  console.warn("⚠️ SIGNING_SECRET não definido (obrigatório para /drive-file assinado)");
+  console.warn("⚠️ SIGNING_SECRET não definido (recomendado para /drive-file assinado)");
 }
 
-// ---------- Firebase Admin ----------
+// ===============================
+// Firebase Admin
+// ===============================
 function loadServiceAccount() {
   if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
     return JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
   }
   const file = path.join(__dirname, "serviceAccountKey.json");
   if (fs.existsSync(file)) return require(file);
-  throw new Error("Faltando credencial Firebase Admin.");
+  throw new Error("Faltando credencial Firebase Admin (FIREBASE_SERVICE_ACCOUNT_JSON ou serviceAccountKey.json).");
 }
 
 admin.initializeApp({
@@ -62,164 +63,145 @@ admin.initializeApp({
 });
 const db = admin.firestore();
 
-// ---------- Google Drive (Service Account) ----------
+// ===============================
+// Helpers
+// ===============================
 function readJsonFlexible(v) {
   if (!v) return null;
   const trimmed = String(v).trim();
+
+  // JSON direto na env
   if (trimmed.startsWith("{") && trimmed.endsWith("}")) return JSON.parse(trimmed);
 
+  // caminho de arquivo
   const abs = path.isAbsolute(trimmed) ? trimmed : path.join(__dirname, trimmed);
   return JSON.parse(fs.readFileSync(abs, "utf8"));
 }
 
-function getDriveRootFolderIdOrThrow() {
-  const id = String(process.env.DRIVE_ROOT_FOLDER_ID || "").trim();
-  if (!id) {
-    throw new Error(
-      "DRIVE_ROOT_FOLDER_ID não definido no ambiente. Sem isso, o upload cai no Drive da service account e dá 'no storage quota'."
-    );
-  }
-  return id;
+function mustEnv(name) {
+  const v = String(process.env[name] || "").trim();
+  if (!v) throw new Error(`Faltando ${name} no ambiente.`);
+  return v;
 }
 
+function getDriveRootFolderIdOrThrow() {
+  // esse é o ID da pasta "Checklists_App" OU "CHECKLISTS" (o que você preferir como root)
+  // o código cria {ROOT}/CHECKLISTS/{codigoPosto}/{runId}
+  return mustEnv("DRIVE_ROOT_FOLDER_ID");
+}
+
+// ===============================
+// Google Drive (OAuth) ✅
+// ===============================
 function createDriveClient() {
-  const saVar = process.env.DRIVE_SERVICE_ACCOUNT_JSON;
-  if (!saVar) throw new Error("Faltando DRIVE_SERVICE_ACCOUNT_JSON");
+  const credsVar = mustEnv("DRIVE_OAUTH_CREDENTIALS_JSON");
+  const tokenVar = mustEnv("DRIVE_OAUTH_TOKEN_JSON");
 
-  const serviceAccount = readJsonFlexible(saVar);
+  const credentials = readJsonFlexible(credsVar);
+  const token = readJsonFlexible(tokenVar);
 
-  const auth = new google.auth.GoogleAuth({
-    credentials: serviceAccount,
-    scopes: ["https://www.googleapis.com/auth/drive",
-      "https://www.googleapis.com/auth/drive.file"
-    ],
+  const { client_id, client_secret, redirect_uris } =
+    credentials.installed || credentials.web;
+
+  if (!client_id || !client_secret) {
+    throw new Error("Credenciais OAuth inválidas (client_id/client_secret ausentes).");
+  }
+
+  const oAuth2Client = new google.auth.OAuth2(
+    client_id,
+    client_secret,
+    redirect_uris?.[0] || "http://localhost"
+  );
+
+  oAuth2Client.setCredentials(token);
+
+  // log quando renovar
+  oAuth2Client.on("tokens", (t) => {
+    if (t.access_token) console.log("✅ Drive: access_token renovado");
+    if (t.refresh_token) console.log("✅ Drive: NOVO refresh_token recebido (guarde!)");
   });
 
-  return google.drive({ version: "v3", auth });
+  return google.drive({ version: "v3", auth: oAuth2Client });
 }
 
 const drive = createDriveClient();
 
-async function assertDriveRootAccessible() {
-  const rootId = getDriveRootFolderIdOrThrow();
-
-  // valida se a service account enxerga a pasta
-  const meta = await drive.files.get({
-    fileId: rootId,
-    fields: "id,name,mimeType,capabilities",
-    supportsAllDrives: true,
-  });
-
-  const canAdd = meta?.data?.capabilities?.canAddChildren;
-  if (!canAdd) {
-    throw new Error(
-      `A service account NÃO tem permissão de escrever na pasta (${rootId}). Compartilhe a pasta com permissão de EDITOR para o client_email da service account.`
-    );
+// valida o acesso ao root no start (log claro)
+(async () => {
+  try {
+    const rootId = getDriveRootFolderIdOrThrow();
+    const meta = await drive.files.get({ fileId: rootId, fields: "id,name,mimeType" });
+    console.log("✅ Drive root OK:", meta.data?.name, rootId);
+  } catch (e) {
+    console.error("❌ Drive root check error:", e?.message || e);
   }
-
-  console.log("✅ Drive root OK:", meta.data?.name, rootId);
-}
-
-// Rode uma verificação no start (não derruba o server, mas loga erro claro)
-assertDriveRootAccessible().catch((e) => {
-  console.error("❌ Drive root access error:", e?.message || e);
-});
-
-const folderCache = new Map();
+})();
 
 async function findOrCreateFolder(name, parentId) {
-
-  const cacheKey = `${parentId}_${name}`;
-
-  if (folderCache.has(cacheKey)) {
-    return folderCache.get(cacheKey);
-  }
+  if (!parentId) throw new Error("parentId ausente em findOrCreateFolder.");
 
   const safeName = name.replace(/'/g, "\\'");
+  const q = [
+    `mimeType='application/vnd.google-apps.folder'`,
+    `name='${safeName}'`,
+    `trashed=false`,
+    `'${parentId}' in parents`,
+  ].join(" and ");
 
   const list = await drive.files.list({
-    q: `
-      mimeType='application/vnd.google-apps.folder'
-      and name='${safeName}'
-      and trashed=false
-      and '${parentId}' in parents
-    `,
+    q,
     fields: "files(id,name)",
     spaces: "drive",
-    includeItemsFromAllDrives: true,
-    supportsAllDrives: true
   });
 
-  if (list.data.files.length > 0) {
-    const id = list.data.files[0].id;
-    folderCache.set(cacheKey, id);
-    return id;
-  }
+  if (list.data.files?.length) return list.data.files[0].id;
 
   const created = await drive.files.create({
     requestBody: {
-      name: filename,
+      name,
+      mimeType: "application/vnd.google-apps.folder",
       parents: [parentId],
     },
-    media: {
-      mimeType: mime,      
-      body: stream,
-    },
     fields: "id",
-    supportsAllDrives: true,
-    includeItemsFromAllDrives: true,
-  });
-
-  const id = created.data.id;
-
-  folderCache.set(cacheKey, id);
-
-  return id;
-}
-
-async function uploadBufferToDrive({ buffer, mime, filename, parentId }) {
-
-  const stream = Readable.from(buffer);
-
-  const created = await drive.files.create({
-    requestBody: {
-      name: filename,
-      parents: [parentId]
-    },
-    media: {
-      mimeType: mime,
-      body: stream
-    },
-    fields: "id",
-    supportsAllDrives: true
   });
 
   return created.data.id;
 }
+
+async function uploadBufferToDrive({ buffer, mime, filename, parentId }) {
+  if (!parentId) throw new Error("parentId ausente em uploadBufferToDrive.");
+
+  const stream = Readable.from(buffer);
+
+  const created = await drive.files.create({
+    requestBody: { name: filename, parents: [parentId] },
+    media: { mimeType: mime || "image/jpeg", body: stream },
+    fields: "id",
+  });
+
+  return created.data.id;
+}
+
 async function uploadBase64ToDrive({ base64, mime, filename, parentId }) {
-  if (!parentId) throw new Error("parentId ausente em uploadBase64ToDrive (isso causaria quota error).");
+  if (!parentId) throw new Error("parentId ausente em uploadBase64ToDrive.");
 
   const buffer = Buffer.from(base64, "base64");
   const stream = Readable.from(buffer);
 
   const created = await drive.files.create({
-    requestBody: {
-      name: filename,
-      parents: [parentId],
-    },
-    media: {
-      mimeType: mime || "image/jpeg",
-      body: stream,
-    },
+    requestBody: { name: filename, parents: [parentId] },
+    media: { mimeType: mime || "image/jpeg", body: stream },
     fields: "id",
-    supportsAllDrives: true,
   });
 
   return created.data.id;
 }
 
-// ---------- Assinatura URL ----------
+// ===============================
+// Assinatura URL (pra não expor Drive direto)
+// ===============================
 function signFileUrl(fileId, expiresAtMs) {
+  if (!SIGNING_SECRET) return null;
   const payload = `${fileId}.${expiresAtMs}`;
   const sig = crypto.createHmac("sha256", SIGNING_SECRET).update(payload).digest("hex");
   return `${expiresAtMs}.${sig}`;
@@ -229,7 +211,7 @@ function verifySignedToken(fileId, token) {
   if (!SIGNING_SECRET) return false;
   if (!token) return false;
 
-  const [expStr, sig] = token.split(".");
+  const [expStr, sig] = String(token).split(".");
   const exp = Number(expStr);
   if (!exp || !sig) return false;
   if (Date.now() > exp) return false;
@@ -244,7 +226,9 @@ function verifySignedToken(fileId, token) {
   }
 }
 
-// ---------- Rotas ----------
+// ===============================
+// Rotas básicas
+// ===============================
 app.get("/", (req, res) => res.send("OK"));
 app.get("/portal/ping", (req, res) => res.json({ ok: true, name: "portal-api" }));
 
@@ -257,52 +241,37 @@ async function requireFirebaseAuth(req, res, next) {
     const decoded = await admin.auth().verifyIdToken(token);
     req.user = decoded;
     next();
-  } catch (e) {
+  } catch {
     return res.status(401).json({ error: "invalid token" });
   }
 }
+
 // ===============================
-// Telegram (ENV)
+// Telegram (opcional) - 1 função só ✅
 // ===============================
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
 async function sendTelegram(text) {
-  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-    console.warn("⚠️ TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID não configurados");
-    return { ok: false, skipped: true };
-  }
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return { ok: false, skipped: true };
 
   const resp = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: String(TELEGRAM_CHAT_ID),
-      text: String(text || ""),
-    }),
-  });
+    body: JSON.stringify({ chat_id: String(TELEGRAM_CHAT_ID), text: String(text || "") }),
+  }).catch(() => null);
 
-  if (!resp.ok) {
-    const json = await resp.json().catch(() => null);
-    console.log("telegram sendMessage erro:", resp.status, json);
-    return { ok: false, status: resp.status, json };
-  }
-
+  if (!resp || !resp.ok) return { ok: false };
   return { ok: true };
 }
 
-// ===============================
-// ✅ App -> avisa "novo cadastro" (seguro)
-// ===============================
 app.post("/app/telegram/new-user", requireFirebaseAuth, async (req, res) => {
   try {
     const uid = req.user?.uid;
     if (!uid) return res.status(401).json({ error: "unauthorized" });
 
-    // opcional: aceitar override do device vindo do app
     const deviceFromApp = req.body?.deviceName ? String(req.body.deviceName) : "";
 
-    // lê dados do perfil pelo Admin SDK
     const snap = await db.collection("usuarios").doc(String(uid)).get();
     if (!snap.exists) return res.status(404).json({ error: "perfil nao encontrado" });
 
@@ -311,12 +280,8 @@ app.post("/app/telegram/new-user", requireFirebaseAuth, async (req, res) => {
     const nomePosto = String(u.nomePosto || "");
     const codigoPosto = String(u.codigoPosto || "");
     const telefone = String(u.telefone || "");
+    const device = deviceFromApp || String(u.deviceNameAtual1 || u.deviceName1 || "");
 
-    const device =
-      deviceFromApp ||
-      String(u.deviceNameAtual1 || u.deviceName1 || "");
-
-    // ✅ manda telegram
     const text =
       `👤 NOVO CADASTRO (APP)\n` +
       `📧 Email: ${email}\n` +
@@ -327,7 +292,6 @@ app.post("/app/telegram/new-user", requireFirebaseAuth, async (req, res) => {
       `🏷 Código: ${codigoPosto || "—"}`;
 
     await sendTelegram(text);
-
     return res.json({ ok: true });
   } catch (e) {
     console.error("/app/telegram/new-user error:", e);
@@ -335,115 +299,13 @@ app.post("/app/telegram/new-user", requireFirebaseAuth, async (req, res) => {
   }
 });
 
-async function requireSuperAdmin(req, res, next) {
-  try {
-    const uid = req.user?.uid;
-    const snap = await db.collection("usuarios").doc(uid).get();
-    const role = snap.exists ? snap.data()?.rolePortal : null;
-    if (role !== "super_admin") return res.status(403).json({ error: "only super_admin" });
-    next();
-  } catch (e) {
-    return res.status(500).json({ error: "role check failed" });
-  }
-}
-
-app.post("/portal/set-access", requireFirebaseAuth, requireSuperAdmin, async (req, res) => {
-  try {
-    const { targetUid, rolePortal, postosPermitidos } = req.body || {};
-
-    if (!targetUid) return res.status(400).json({ error: "targetUid obrigatório" });
-    if (!rolePortal || !["admin", "super_admin"].includes(String(rolePortal)))
-      return res.status(400).json({ error: "rolePortal inválido" });
-
-    const lista = Array.isArray(postosPermitidos) ? postosPermitidos.map(String) : [];
-
-    const patch = {
-      rolePortal: String(rolePortal),
-      postosPermitidos: rolePortal === "super_admin" ? [] : lista,
-      atualizadoEm: admin.firestore.FieldValue.serverTimestamp(),
-    };
-
-    await db.collection("usuarios").doc(String(targetUid)).set(patch, { merge: true });
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error("set-access error:", e);
-    return res.status(500).json({ error: e?.message || "Falha ao atualizar acesso" });
-  }
-});
-// ================================
-// ✅ TELEGRAM - PRIMEIRO LOGIN 1x
-// ================================
-
-async function sendTelegram(text) {
-  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return; // não quebra se não configurar
-  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-  await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: String(TELEGRAM_CHAT_ID), text: String(text) }),
-  }).catch(() => {});
-}
-
-// Auth: você já tem requireFirebaseAuth
-
-app.post("/notify-first-login", requireFirebaseAuth, async (req, res) => {
-  try {
-    const uid = String(req.user?.uid || "");
-    if (!uid) return res.status(400).json({ error: "uid ausente" });
-
-    const userRef = db.collection("usuarios").doc(uid);
-
-    const result = await db.runTransaction(async (tx) => {
-      const snap = await tx.get(userRef);
-      if (!snap.exists) return { ok: false, reason: "perfil_nao_existe" };
-
-      const data = snap.data() || {};
-      if (data.primeiroLoginNotificadoEm) {
-        return { ok: true, sent: false, data };
-      }
-
-      tx.set(
-        userRef,
-        { primeiroLoginNotificadoEm: admin.firestore.FieldValue.serverTimestamp() },
-        { merge: true }
-      );
-
-      return { ok: true, sent: true, data };
-    });
-
-    if (!result.ok) return res.status(400).json(result);
-
-    if (result.sent) {
-      const d = result.data || {};
-      const email = req.user?.email || d.email || "-";
-      const codigoPosto = d.codigoPosto || "-";
-      const nomePosto = d.nomePosto || "-";
-
-      const text =
-        `✅ PRIMEIRO LOGIN (APP NOVO)\n` +
-        `📧 Email: ${email}\n` +
-        `🆔 UID: ${uid}\n` +
-        `🏪 Posto: ${nomePosto} (${codigoPosto})\n` +
-        `🕒 ${new Date().toISOString()}`;
-
-      await sendTelegram(text);
-    }
-
-    return res.json({ ok: true, sent: !!result.sent });
-  } catch (e) {
-    console.error("notify-first-login error:", e);
-    return res.status(500).json({ error: e?.message || "Falha" });
-  }
-});
-// ---------- Mercado Pago ----------
+// ===============================
+// Mercado Pago (opcional)
+// ===============================
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
-if (!MP_ACCESS_TOKEN) {
-  console.warn("⚠️ MP_ACCESS_TOKEN não definido (Mercado Pago desativado)");
-}
+if (!MP_ACCESS_TOKEN) console.warn("⚠️ MP_ACCESS_TOKEN não definido (Mercado Pago desativado)");
 
-const mpClient = MP_ACCESS_TOKEN
-  ? new MercadoPagoConfig({ accessToken: MP_ACCESS_TOKEN })
-  : null;
+const mpClient = MP_ACCESS_TOKEN ? new MercadoPagoConfig({ accessToken: MP_ACCESS_TOKEN }) : null;
 
 function mustHaveMP(req, res) {
   if (!mpClient) {
@@ -452,7 +314,7 @@ function mustHaveMP(req, res) {
   }
   return true;
 }
-// ✅ TABELA DE PLANOS (UI + BACKEND)
+
 const PLANS = {
   mensal:     { label: "Mensal",      price: 24.99, months: 1,  acessos: 1 },
   trimestral: { label: "Trimestral",  price: 64.99, months: 3,  acessos: 1 },
@@ -467,24 +329,13 @@ function calcVencimentoByPlano(planoKey) {
   venc.setMonth(venc.getMonth() + Number(cfg.months || 1));
   return { venc, cfg };
 }
-/**
- * ✅ Criar preferência (gera link de pagamento)
- * Body esperado:
- * {
- *   uid: "uid do usuário",
- *   plano: "mensal" | "trimestral" | "anual" | "anual_plus",
- *   email: "email do pagador",
- *   nomePosto: "..."
- * }
- */
+
 app.post("/mp/create-preference", async (req, res) => {
   try {
     if (!mustHaveMP(req, res)) return;
 
     const { uid, plano, email, nomePosto } = req.body || {};
-    if (!uid || !plano) {
-      return res.status(400).json({ error: "faltando uid/plano" });
-    }
+    if (!uid || !plano) return res.status(400).json({ error: "faltando uid/plano" });
 
     const plan = PLANS[String(plano)];
     if (!plan) return res.status(400).json({ error: "plano inválido" });
@@ -494,20 +345,14 @@ app.post("/mp/create-preference", async (req, res) => {
 
     const result = await preference.create({
       body: {
-        items: [
-          {
-            title: `Plano ${plan.label} - Análise de Combustível`,
-            quantity: 1,
-            currency_id: "BRL",
-            unit_price: Number(plan.price),
-          },
-        ],
+        items: [{
+          title: `Plano ${plan.label} - Análise de Combustível`,
+          quantity: 1,
+          currency_id: "BRL",
+          unit_price: Number(plan.price),
+        }],
         payer: email ? { email: String(email) } : undefined,
-        metadata: {
-          uid: String(uid),
-          plano: String(plano),
-          nomePosto: nomePosto ? String(nomePosto) : "",
-        },
+        metadata: { uid: String(uid), plano: String(plano), nomePosto: nomePosto ? String(nomePosto) : "" },
         notification_url,
       },
     });
@@ -523,10 +368,6 @@ app.post("/mp/create-preference", async (req, res) => {
   }
 });
 
-/**
- * ✅ Webhook do Mercado Pago
- * O MP manda: ?type=payment&data.id=xxxx (ou em body dependendo do modo)
- */
 app.post("/mp/webhook", async (req, res) => {
   try {
     if (!mustHaveMP(req, res)) return;
@@ -534,27 +375,21 @@ app.post("/mp/webhook", async (req, res) => {
     const type = req.query.type || req.body?.type;
     const dataId = req.query["data.id"] || req.body?.data?.id;
 
-    // Sempre responde 200 rápido pro MP não ficar reenviando
-    res.sendStatus(200);
+    res.sendStatus(200); // responde rápido
 
     if (type !== "payment" || !dataId) return;
 
     const paymentApi = new Payment(mpClient);
     const pay = await paymentApi.get({ id: String(dataId) });
 
-    const status = pay?.status; // approved, rejected, pending...
+    const status = pay?.status;
     const metadata = pay?.metadata || {};
     const uid = metadata?.uid;
     const plano = metadata?.plano;
 
-    if (!uid) {
-      console.log("mp/webhook: pagamento sem uid no metadata", dataId);
-      return;
-    }
+    if (!uid) return;
 
-    // ✅ Atualiza Firestore via Admin SDK (não depende de rules)
     const userRef = db.collection("usuarios").doc(String(uid));
-
     const { venc, cfg } = calcVencimentoByPlano(plano);
 
     const patch = {
@@ -574,54 +409,26 @@ app.post("/mp/webhook", async (req, res) => {
     }
 
     await userRef.set(patch, { merge: true });
-
-    console.log("mp/webhook ok:", dataId, status, uid, plano);
   } catch (e) {
     console.error("mp/webhook error:", e);
-    // não responde aqui porque já respondemos 200
   }
 });
 
-/**
- * ✅ Consultar status manual (debug)
- * GET /mp/payment-status/:id
- */
-app.get("/mp/payment-status/:id", async (req, res) => {
-  try {
-    if (!mustHaveMP(req, res)) return;
+// ===============================
+// Upload de fotos (Drive OAuth) ✅
+// Estrutura: {ROOT}/CHECKLISTS/{codigoPosto}/{runId}/arquivo.jpg
+// ===============================
 
-    const paymentApi = new Payment(mpClient);
-    const pay = await paymentApi.get({ id: String(req.params.id) });
-
-    return res.json({
-      id: pay.id,
-      status: pay.status,
-      status_detail: pay.status_detail,
-      metadata: pay.metadata,
-      payer: pay.payer?.email,
-      transaction_amount: pay.transaction_amount,
-    });
-  } catch (e) {
-    console.error("mp/payment-status error:", e);
-    return res.status(500).json({ error: e?.message || "Falha ao consultar pagamento" });
-  }
-});
-/**
- * ✅ ROTA ANTIGA (base64)
- * Mantive para compatibilidade.
- * Se quiser mais rápido: use /upload-foto-multipart no app.
- */
+// Rota antiga base64
 app.post("/upload-foto", async (req, res) => {
   try {
-    const { codigoPosto, runId, itemId, mime, base64 } = req.body;
-
+    const { codigoPosto, runId, itemId, mime, base64 } = req.body || {};
     if (!codigoPosto || !runId || !itemId || !base64) {
       return res.status(400).json({ error: "faltando codigoPosto/runId/itemId/base64" });
     }
 
     const rootId = getDriveRootFolderIdOrThrow();
 
-    // Estrutura: {ROOT}/CHECKLISTS/{codigoPosto}/{runId}/arquivo.jpg
     const baseFolder = await findOrCreateFolder("CHECKLISTS", rootId);
     const postoFolder = await findOrCreateFolder(String(codigoPosto), baseFolder);
     const runFolder = await findOrCreateFolder(String(runId), postoFolder);
@@ -650,23 +457,11 @@ app.post("/upload-foto", async (req, res) => {
     return res.status(500).json({ error: e?.message || "Falha ao fazer upload da foto" });
   }
 });
-/**
- * ✅ ROTA NOVA (MULTIPART) - MUITO MAIS RÁPIDA
- * No app, envie FormData com:
- * - codigoPosto, runId, itemId
- * - file (jpeg/png)
- */
+
+// Rota nova multipart
 app.post("/upload-foto-multipart", upload.single("file"), async (req, res) => {
   try {
-    const start = Date.now();
-    console.log("UPLOAD MULTIPART HIT", {
-      codigoPosto: req.body?.codigoPosto,
-      runId: req.body?.runId,
-      itemId: req.body?.itemId,
-      hasFile: !!req.file
-    });
-
-    const { codigoPosto, runId, itemId } = req.body;
+    const { codigoPosto, runId, itemId } = req.body || {};
     const file = req.file;
 
     if (!codigoPosto || !runId || !itemId || !file) {
@@ -701,64 +496,93 @@ app.post("/upload-foto-multipart", upload.single("file"), async (req, res) => {
     });
 
     return res.json({ fileId });
-
   } catch (e) {
     console.error("upload-foto-multipart error:", e);
     return res.status(500).json({ error: e?.message || "Falha ao fazer upload da foto" });
   }
 });
 
-// Gera URLs assinadas (APP e PORTAL)
-app.post("/signed-urls", async (req, res) => {
+// ===============================
+// Signed URLs (APP/PORTAL)
+// Body: { fileIds: ["id1","id2"] }
+// Retorna: [{ fileId, url }]
+// ===============================
+app.post("/signed-urls", requireFirebaseAuth, async (req, res) => {
   try {
-    const { fileIds } = req.body;
-    if (!Array.isArray(fileIds)) return res.status(400).json({ error: "fileIds inválido" });
-    if (!SIGNING_SECRET) return res.status(500).json({ error: "SIGNING_SECRET não configurado" });
-
-    const expiresAt = Date.now() + 15 * 60 * 1000; // 15 min
-    const urls = {};
-
-    for (const id of fileIds) {
-      if (!id) continue;
-      const token = signFileUrl(String(id), expiresAt);
-      urls[id] = `${PUBLIC_BASE_URL}/drive-file/${id}?t=${encodeURIComponent(token)}`;
+    const { fileIds } = req.body || {};
+    if (!Array.isArray(fileIds) || fileIds.length === 0) {
+      return res.status(400).json({ error: "fileIds inválido" });
     }
 
-    return res.json({ urls });
-  } catch (e) {
-    console.error("signed-urls error:", e);
-    return res.status(500).json({ error: e?.message || "Falha ao gerar urls" });
-  }
-});
+    if (!SIGNING_SECRET) {
+      return res.status(500).json({ error: "SIGNING_SECRET não configurado no backend" });
+    }
 
-app.get("/drive-file/:id", async (req, res) => {
-  try {
-    const fileId = String(req.params.id);
-    const token = String(req.query.t || "");
-
-    if (!SIGNING_SECRET) return res.status(500).send("SIGNING_SECRET missing");
-    if (!verifySignedToken(fileId, token)) return res.status(403).send("forbidden");
-
-    const meta = await drive.files.get({ fileId, fields: "mimeType,name" });
-    const mimeType = meta.data.mimeType || "image/jpeg";
-
-    res.setHeader("Content-Type", mimeType);
-    res.setHeader("Cache-Control", "public, max-age=900");
-
-    const file = await drive.files.get({ fileId, alt: "media" }, { responseType: "stream" });
-
-    file.data.on("error", (err) => {
-      console.error("Drive stream error:", err);
-      res.sendStatus(500);
+    const exp = Date.now() + 1000 * 60 * 20; // 20 min
+    const out = fileIds.map((id) => {
+      const token = signFileUrl(String(id), exp);
+      return {
+        fileId: String(id),
+        url: `${PUBLIC_BASE_URL}/drive-file/${encodeURIComponent(String(id))}?token=${encodeURIComponent(token)}`,
+      };
     });
 
-    file.data.pipe(res);
+    return res.json({ items: out, expiresAt: exp });
   } catch (e) {
-    console.error("drive-file error:", e);
-    return res.sendStatus(404);
+    console.error("signed-urls error:", e);
+    return res.status(500).json({ error: e?.message || "Falha ao gerar signed urls" });
   }
 });
-app.get("/debug/ping", (req, res) => {return res.json({ok: true, time: new Date().toISOString(), backend: "render",});
+
+// ===============================
+// Proxy de download (não expõe Drive)
+// GET /drive-file/:fileId?token=...
+// ===============================
+app.get("/drive-file/:fileId", async (req, res) => {
+  try {
+    const fileId = String(req.params.fileId || "");
+    const token = String(req.query.token || "");
+
+    if (!fileId) return res.status(400).send("missing fileId");
+
+    if (SIGNING_SECRET) {
+      if (!verifySignedToken(fileId, token)) return res.status(401).send("invalid token");
+    } else {
+      // se não configurar SIGNING_SECRET, deixa aberto (não recomendado)
+      console.warn("⚠️ /drive-file sem SIGNING_SECRET (rota aberta).");
+    }
+
+    // pega metadata para content-type e nome
+    const meta = await drive.files.get({
+      fileId,
+      fields: "id,name,mimeType,size",
+    });
+
+    const name = meta.data?.name || `${fileId}.jpg`;
+    const mimeType = meta.data?.mimeType || "application/octet-stream";
+
+    // stream do arquivo
+    const streamResp = await drive.files.get(
+      { fileId, alt: "media" },
+      { responseType: "stream" }
+    );
+
+    res.setHeader("Content-Type", mimeType);
+    res.setHeader("Content-Disposition", `inline; filename="${encodeURIComponent(name)}"`);
+
+    streamResp.data
+      .on("error", (err) => {
+        console.error("drive-file stream error:", err?.message || err);
+        if (!res.headersSent) res.status(500).end();
+      })
+      .pipe(res);
+  } catch (e) {
+    console.error("drive-file error:", e?.message || e);
+    return res.status(500).send("drive-file failed");
+  }
 });
 
-app.listen(PORT, () => console.log(`🚀 Server rodando na porta ${PORT}`));
+// ===============================
+app.listen(PORT, () => {
+  console.log(`🚀 Server rodando na porta ${PORT}`);
+});
