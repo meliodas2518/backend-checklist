@@ -505,11 +505,17 @@ app.post("/upload-foto-multipart", upload.single("file"), async (req, res) => {
 // ===============================
 // Signed URLs (APP/PORTAL)
 // Body: { fileIds: ["id1","id2"] }
-// Retorna: [{ fileId, url }]
+// Retorna:
+// {
+//   items: [{ fileId, url }],
+//   urls: { [fileId]: url },
+//   expiresAt
+// }
 // ===============================
 app.post("/signed-urls", requireFirebaseAuth, async (req, res) => {
   try {
     const { fileIds } = req.body || {};
+
     if (!Array.isArray(fileIds) || fileIds.length === 0) {
       return res.status(400).json({ error: "fileIds inválido" });
     }
@@ -519,19 +525,30 @@ app.post("/signed-urls", requireFirebaseAuth, async (req, res) => {
     }
 
     const exp = Date.now() + 1000 * 60 * 20; // 20 min
-    const out = fileIds.map((id) => {
-      const token = signFileUrl(String(id), exp);
-      return {
-        fileId: String(id),
-        url: `${PUBLIC_BASE_URL}/drive-file/${encodeURIComponent(String(id))}?token=${encodeURIComponent(token)}`,
-      };
-    });
 
-    return res.json({ items: out, expiresAt: exp });
+    const out = fileIds
+      .map((id) => String(id || "").trim())
+      .filter(Boolean)
+      .map((id) => {
+        const token = signFileUrl(id, exp);
+        return {
+          fileId: id,
+          url: `${PUBLIC_BASE_URL}/drive-file/${encodeURIComponent(id)}?token=${encodeURIComponent(token)}`,
+        };
+      });
+
+    const urls = Object.fromEntries(out.map((x) => [x.fileId, x.url]));
+
+    return res.json({
+      items: out,
+      urls,
+      expiresAt: exp,
+    });
   } catch (e) {
     console.error("signed-urls error:", e);
     return res.status(500).json({ error: e?.message || "Falha ao gerar signed urls" });
   }
+
 });
 
 // ===============================
