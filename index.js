@@ -316,7 +316,7 @@ function mustHaveMP(req, res) {
 }
 
 const PLANS = {
-  mensal:     { label: "Mensal",      price: 24.99, months: 1,  acessos: 1 },
+  mensal:     { label: "Mensal",      price: 1.99, months: 1,  acessos: 1 },
   trimestral: { label: "Trimestral",  price: 64.99, months: 3,  acessos: 1 },
   anual:      { label: "Anual",       price: 149.99, months: 12, acessos: 1 },
   anual_plus: { label: "Anual Plus",  price: 189.99, months: 12, acessos: 2 },
