@@ -21,8 +21,8 @@ app.use(
   cors({
     origin: [
       "https://portalchecklist.netlify.app",
-      process.env.PORTAL_ORIGIN, // opcional
-      process.env.APP_ORIGIN, // opcional
+      process.env.PORTAL_ORIGIN,
+      process.env.APP_ORIGIN,
     ].filter(Boolean),
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
@@ -32,10 +32,12 @@ app.use(
 app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-// multer (upload por multipart)
+// ===============================
+// Multer (upload multipart)
+// ===============================
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
+  limits: { fileSize: 10 * 1024 * 1024 },
 });
 
 const PORT = process.env.PORT || 3000;
@@ -53,14 +55,19 @@ function loadServiceAccount() {
   if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
     return JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
   }
+
   const file = path.join(__dirname, "serviceAccountKey.json");
   if (fs.existsSync(file)) return require(file);
-  throw new Error("Faltando credencial Firebase Admin (FIREBASE_SERVICE_ACCOUNT_JSON ou serviceAccountKey.json).");
+
+  throw new Error(
+    "Faltando credencial Firebase Admin (FIREBASE_SERVICE_ACCOUNT_JSON ou serviceAccountKey.json)."
+  );
 }
 
 admin.initializeApp({
   credential: admin.credential.cert(loadServiceAccount()),
 });
+
 const db = admin.firestore();
 
 // ===============================
@@ -68,12 +75,13 @@ const db = admin.firestore();
 // ===============================
 function readJsonFlexible(v) {
   if (!v) return null;
+
   const trimmed = String(v).trim();
 
-  // JSON direto na env
-  if (trimmed.startsWith("{") && trimmed.endsWith("}")) return JSON.parse(trimmed);
+  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+    return JSON.parse(trimmed);
+  }
 
-  // caminho de arquivo
   const abs = path.isAbsolute(trimmed) ? trimmed : path.join(__dirname, trimmed);
   return JSON.parse(fs.readFileSync(abs, "utf8"));
 }
@@ -85,13 +93,11 @@ function mustEnv(name) {
 }
 
 function getDriveRootFolderIdOrThrow() {
-  // esse é o ID da pasta "Checklists_App" OU "CHECKLISTS" (o que você preferir como root)
-  // o código cria {ROOT}/CHECKLISTS/{codigoPosto}/{runId}
   return mustEnv("DRIVE_ROOT_FOLDER_ID");
 }
 
 // ===============================
-// Google Drive (OAuth) ✅
+// Google Drive (OAuth)
 // ===============================
 function createDriveClient() {
   const credsVar = mustEnv("DRIVE_OAUTH_CREDENTIALS_JSON");
@@ -115,7 +121,6 @@ function createDriveClient() {
 
   oAuth2Client.setCredentials(token);
 
-  // log quando renovar
   oAuth2Client.on("tokens", (t) => {
     if (t.access_token) console.log("✅ Drive: access_token renovado");
     if (t.refresh_token) console.log("✅ Drive: NOVO refresh_token recebido (guarde!)");
@@ -126,11 +131,14 @@ function createDriveClient() {
 
 const drive = createDriveClient();
 
-// valida o acesso ao root no start (log claro)
+// valida acesso à pasta root
 (async () => {
   try {
     const rootId = getDriveRootFolderIdOrThrow();
-    const meta = await drive.files.get({ fileId: rootId, fields: "id,name,mimeType" });
+    const meta = await drive.files.get({
+      fileId: rootId,
+      fields: "id,name,mimeType",
+    });
     console.log("✅ Drive root OK:", meta.data?.name, rootId);
   } catch (e) {
     console.error("❌ Drive root check error:", e?.message || e);
@@ -174,8 +182,14 @@ async function uploadBufferToDrive({ buffer, mime, filename, parentId }) {
   const stream = Readable.from(buffer);
 
   const created = await drive.files.create({
-    requestBody: { name: filename, parents: [parentId] },
-    media: { mimeType: mime || "image/jpeg", body: stream },
+    requestBody: {
+      name: filename,
+      parents: [parentId],
+    },
+    media: {
+      mimeType: mime || "image/jpeg",
+      body: stream,
+    },
     fields: "id",
   });
 
@@ -189,8 +203,14 @@ async function uploadBase64ToDrive({ base64, mime, filename, parentId }) {
   const stream = Readable.from(buffer);
 
   const created = await drive.files.create({
-    requestBody: { name: filename, parents: [parentId] },
-    media: { mimeType: mime || "image/jpeg", body: stream },
+    requestBody: {
+      name: filename,
+      parents: [parentId],
+    },
+    media: {
+      mimeType: mime || "image/jpeg",
+      body: stream,
+    },
     fields: "id",
   });
 
@@ -198,7 +218,7 @@ async function uploadBase64ToDrive({ base64, mime, filename, parentId }) {
 }
 
 // ===============================
-// Assinatura URL (pra não expor Drive direto)
+// Signed URL helpers
 // ===============================
 function signFileUrl(fileId, expiresAtMs) {
   if (!SIGNING_SECRET) return null;
@@ -213,6 +233,7 @@ function verifySignedToken(fileId, token) {
 
   const [expStr, sig] = String(token).split(".");
   const exp = Number(expStr);
+
   if (!exp || !sig) return false;
   if (Date.now() > exp) return false;
 
@@ -232,34 +253,105 @@ function verifySignedToken(fileId, token) {
 app.get("/", (req, res) => res.send("OK"));
 app.get("/portal/ping", (req, res) => res.json({ ok: true, name: "portal-api" }));
 
+// ===============================
+// Auth middlewares
+// ===============================
 async function requireFirebaseAuth(req, res, next) {
   try {
     const h = req.headers.authorization || "";
     const token = h.startsWith("Bearer ") ? h.slice(7) : null;
-    if (!token) return res.status(401).json({ error: "missing token" });
+
+    if (!token) {
+      return res.status(401).json({ error: "missing token" });
+    }
 
     const decoded = await admin.auth().verifyIdToken(token);
     req.user = decoded;
+
     next();
-  } catch {
+  } catch (e) {
+    console.error("requireFirebaseAuth error:", e);
     return res.status(401).json({ error: "invalid token" });
   }
 }
 
+async function requireSuperAdmin(req, res, next) {
+  try {
+    const uid = req.user?.uid;
+    if (!uid) {
+      return res.status(401).json({ error: "unauthorized" });
+    }
+
+    const snap = await db.collection("usuarios").doc(String(uid)).get();
+    const role = snap.exists ? snap.data()?.rolePortal : null;
+
+    if (role !== "super_admin") {
+      return res.status(403).json({ error: "only super_admin" });
+    }
+
+    next();
+  } catch (e) {
+    console.error("requireSuperAdmin error:", e);
+    return res.status(500).json({ error: "role check failed" });
+  }
+}
+
 // ===============================
-// Telegram (opcional) - 1 função só ✅
+// Portal admin
+// ===============================
+app.post("/portal/set-access", requireFirebaseAuth, requireSuperAdmin, async (req, res) => {
+  try {
+    const { targetUid, rolePortal, postosPermitidos } = req.body || {};
+
+    if (!targetUid) {
+      return res.status(400).json({ error: "targetUid obrigatório" });
+    }
+
+    if (!rolePortal || !["admin", "super_admin"].includes(String(rolePortal))) {
+      return res.status(400).json({ error: "rolePortal inválido" });
+    }
+
+    const lista = Array.isArray(postosPermitidos)
+      ? postosPermitidos.map((x) => String(x).trim()).filter(Boolean)
+      : [];
+
+    const patch = {
+      rolePortal: String(rolePortal),
+      postosPermitidos: rolePortal === "super_admin" ? [] : lista,
+      atualizadoEm: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    await db.collection("usuarios").doc(String(targetUid)).set(patch, { merge: true });
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("portal/set-access error:", e);
+    return res.status(500).json({ error: e?.message || "Falha ao atualizar acesso" });
+  }
+});
+
+// ===============================
+// Telegram
 // ===============================
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
 async function sendTelegram(text) {
-  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return { ok: false, skipped: true };
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+    return { ok: false, skipped: true };
+  }
 
-  const resp = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: String(TELEGRAM_CHAT_ID), text: String(text || "") }),
-  }).catch(() => null);
+  const resp = await fetch(
+    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: String(TELEGRAM_CHAT_ID),
+        text: String(text || ""),
+      }),
+    }
+  ).catch(() => null);
 
   if (!resp || !resp.ok) return { ok: false };
   return { ok: true };
@@ -292,6 +384,7 @@ app.post("/app/telegram/new-user", requireFirebaseAuth, async (req, res) => {
       `🏷 Código: ${codigoPosto || "—"}`;
 
     await sendTelegram(text);
+
     return res.json({ ok: true });
   } catch (e) {
     console.error("/app/telegram/new-user error:", e);
@@ -300,12 +393,16 @@ app.post("/app/telegram/new-user", requireFirebaseAuth, async (req, res) => {
 });
 
 // ===============================
-// Mercado Pago (opcional)
+// Mercado Pago
 // ===============================
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
-if (!MP_ACCESS_TOKEN) console.warn("⚠️ MP_ACCESS_TOKEN não definido (Mercado Pago desativado)");
+if (!MP_ACCESS_TOKEN) {
+  console.warn("⚠️ MP_ACCESS_TOKEN não definido (Mercado Pago desativado)");
+}
 
-const mpClient = MP_ACCESS_TOKEN ? new MercadoPagoConfig({ accessToken: MP_ACCESS_TOKEN }) : null;
+const mpClient = MP_ACCESS_TOKEN
+  ? new MercadoPagoConfig({ accessToken: MP_ACCESS_TOKEN })
+  : null;
 
 function mustHaveMP(req, res) {
   if (!mpClient) {
@@ -316,10 +413,10 @@ function mustHaveMP(req, res) {
 }
 
 const PLANS = {
-  mensal:     { label: "Mensal",      price: 1.99, months: 1,  acessos: 1 },
-  trimestral: { label: "Trimestral",  price: 64.99, months: 3,  acessos: 1 },
-  anual:      { label: "Anual",       price: 149.99, months: 12, acessos: 1 },
-  anual_plus: { label: "Anual Plus",  price: 189.99, months: 12, acessos: 2 },
+  mensal: { label: "Mensal", price: 1.99, months: 1, acessos: 1 },
+  trimestral: { label: "Trimestral", price: 64.99, months: 3, acessos: 1 },
+  anual: { label: "Anual", price: 149.99, months: 12, acessos: 1 },
+  anual_plus: { label: "Anual Plus", price: 189.99, months: 12, acessos: 2 },
 };
 
 function calcVencimentoByPlano(planoKey) {
@@ -335,24 +432,34 @@ app.post("/mp/create-preference", async (req, res) => {
     if (!mustHaveMP(req, res)) return;
 
     const { uid, plano, email, nomePosto } = req.body || {};
-    if (!uid || !plano) return res.status(400).json({ error: "faltando uid/plano" });
+    if (!uid || !plano) {
+      return res.status(400).json({ error: "faltando uid/plano" });
+    }
 
     const plan = PLANS[String(plano)];
-    if (!plan) return res.status(400).json({ error: "plano inválido" });
+    if (!plan) {
+      return res.status(400).json({ error: "plano inválido" });
+    }
 
     const preference = new Preference(mpClient);
     const notification_url = `${PUBLIC_BASE_URL}/mp/webhook`;
 
     const result = await preference.create({
       body: {
-        items: [{
-          title: `Plano ${plan.label} - Análise de Combustível`,
-          quantity: 1,
-          currency_id: "BRL",
-          unit_price: Number(plan.price),
-        }],
+        items: [
+          {
+            title: `Plano ${plan.label} - Análise de Combustível`,
+            quantity: 1,
+            currency_id: "BRL",
+            unit_price: Number(plan.price),
+          },
+        ],
         payer: email ? { email: String(email) } : undefined,
-        metadata: { uid: String(uid), plano: String(plano), nomePosto: nomePosto ? String(nomePosto) : "" },
+        metadata: {
+          uid: String(uid),
+          plano: String(plano),
+          nomePosto: nomePosto ? String(nomePosto) : "",
+        },
         notification_url,
       },
     });
@@ -375,7 +482,7 @@ app.post("/mp/webhook", async (req, res) => {
     const type = req.query.type || req.body?.type;
     const dataId = req.query["data.id"] || req.body?.data?.id;
 
-    res.sendStatus(200); // responde rápido
+    res.sendStatus(200);
 
     if (type !== "payment" || !dataId) return;
 
@@ -415,25 +522,23 @@ app.post("/mp/webhook", async (req, res) => {
 });
 
 // ===============================
-// Upload de fotos (Drive OAuth) ✅
-// Estrutura: {ROOT}/CHECKLISTS/{codigoPosto}/{runId}/arquivo.jpg
+// Upload de fotos
 // ===============================
-
-// Rota antiga base64
 app.post("/upload-foto", async (req, res) => {
   try {
     const { codigoPosto, runId, itemId, mime, base64 } = req.body || {};
+
     if (!codigoPosto || !runId || !itemId || !base64) {
       return res.status(400).json({ error: "faltando codigoPosto/runId/itemId/base64" });
     }
 
     const rootId = getDriveRootFolderIdOrThrow();
-
     const baseFolder = await findOrCreateFolder("CHECKLISTS", rootId);
     const postoFolder = await findOrCreateFolder(String(codigoPosto), baseFolder);
     const runFolder = await findOrCreateFolder(String(runId), postoFolder);
 
-    const ext = mime === "image/png" ? "png" : mime === "image/webp" ? "webp" : "jpg";
+    const ext =
+      mime === "image/png" ? "png" : mime === "image/webp" ? "webp" : "jpg";
     const filename = `${itemId}_${Date.now()}.${ext}`;
 
     const fileId = await uploadBase64ToDrive({
@@ -458,7 +563,6 @@ app.post("/upload-foto", async (req, res) => {
   }
 });
 
-// Rota nova multipart
 app.post("/upload-foto-multipart", upload.single("file"), async (req, res) => {
   try {
     const { codigoPosto, runId, itemId } = req.body || {};
@@ -469,13 +573,13 @@ app.post("/upload-foto-multipart", upload.single("file"), async (req, res) => {
     }
 
     const rootId = getDriveRootFolderIdOrThrow();
-
     const baseFolder = await findOrCreateFolder("CHECKLISTS", rootId);
     const postoFolder = await findOrCreateFolder(String(codigoPosto), baseFolder);
     const runFolder = await findOrCreateFolder(String(runId), postoFolder);
 
     const mime = file.mimetype || "image/jpeg";
-    const ext = mime === "image/png" ? "png" : mime === "image/webp" ? "webp" : "jpg";
+    const ext =
+      mime === "image/png" ? "png" : mime === "image/webp" ? "webp" : "jpg";
     const filename = `${itemId}_${Date.now()}.${ext}`;
 
     const fileId = await uploadBufferToDrive({
@@ -503,14 +607,7 @@ app.post("/upload-foto-multipart", upload.single("file"), async (req, res) => {
 });
 
 // ===============================
-// Signed URLs (APP/PORTAL)
-// Body: { fileIds: ["id1","id2"] }
-// Retorna:
-// {
-//   items: [{ fileId, url }],
-//   urls: { [fileId]: url },
-//   expiresAt
-// }
+// Signed URLs
 // ===============================
 app.post("/signed-urls", requireFirebaseAuth, async (req, res) => {
   try {
@@ -524,7 +621,7 @@ app.post("/signed-urls", requireFirebaseAuth, async (req, res) => {
       return res.status(500).json({ error: "SIGNING_SECRET não configurado no backend" });
     }
 
-    const exp = Date.now() + 1000 * 60 * 20; // 20 min
+    const exp = Date.now() + 1000 * 60 * 20;
 
     const out = fileIds
       .map((id) => String(id || "").trim())
@@ -548,12 +645,10 @@ app.post("/signed-urls", requireFirebaseAuth, async (req, res) => {
     console.error("signed-urls error:", e);
     return res.status(500).json({ error: e?.message || "Falha ao gerar signed urls" });
   }
-
 });
 
 // ===============================
-// Proxy de download (não expõe Drive)
-// GET /drive-file/:fileId?token=...
+// Proxy do Drive
 // ===============================
 app.get("/drive-file/:fileId", async (req, res) => {
   try {
@@ -563,13 +658,13 @@ app.get("/drive-file/:fileId", async (req, res) => {
     if (!fileId) return res.status(400).send("missing fileId");
 
     if (SIGNING_SECRET) {
-      if (!verifySignedToken(fileId, token)) return res.status(401).send("invalid token");
+      if (!verifySignedToken(fileId, token)) {
+        return res.status(401).send("invalid token");
+      }
     } else {
-      // se não configurar SIGNING_SECRET, deixa aberto (não recomendado)
       console.warn("⚠️ /drive-file sem SIGNING_SECRET (rota aberta).");
     }
 
-    // pega metadata para content-type e nome
     const meta = await drive.files.get({
       fileId,
       fields: "id,name,mimeType,size",
@@ -578,14 +673,16 @@ app.get("/drive-file/:fileId", async (req, res) => {
     const name = meta.data?.name || `${fileId}.jpg`;
     const mimeType = meta.data?.mimeType || "application/octet-stream";
 
-    // stream do arquivo
     const streamResp = await drive.files.get(
       { fileId, alt: "media" },
       { responseType: "stream" }
     );
 
     res.setHeader("Content-Type", mimeType);
-    res.setHeader("Content-Disposition", `inline; filename="${encodeURIComponent(name)}"`);
+    res.setHeader(
+      "Content-Disposition",
+      `inline; filename="${encodeURIComponent(name)}"`
+    );
 
     streamResp.data
       .on("error", (err) => {
