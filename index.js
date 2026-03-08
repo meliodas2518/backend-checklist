@@ -274,7 +274,59 @@ async function requireFirebaseAuth(req, res, next) {
     return res.status(401).json({ error: "invalid token" });
   }
 }
+app.post("/trial/start", requireFirebaseAuth, async (req, res) => {
+  try {
+    const uid = req.user?.uid;
+    if (!uid) {
+      return res.status(401).json({ error: "unauthorized" });
+    }
 
+    const userRef = db.collection("usuarios").doc(String(uid));
+    const snap = await userRef.get();
+
+    if (!snap.exists) {
+      return res.status(404).json({ error: "perfil nao encontrado" });
+    }
+
+    const data = snap.data() || {};
+
+    // já usou trial alguma vez
+    if (data.trialUsado === true) {
+      return res.status(400).json({ error: "Você já utilizou o teste grátis nesta conta." });
+    }
+
+    const agora = new Date();
+    const fim = new Date();
+    fim.setDate(fim.getDate() + 7);
+
+    await userRef.set(
+      {
+        trialUsado: true,
+        trialAtivo: true,
+        trialTipo: "7_dias",
+        trialInicio: agora,
+        trialFim: fim,
+
+        autorizado: true,
+        plano: "trial_7dias",
+        acessosPermitidos: 1,
+        vencimento: fim,
+
+        atualizadoEm: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    return res.json({
+      ok: true,
+      message: "Teste grátis ativado com sucesso.",
+      trialFim: fim,
+    });
+  } catch (e) {
+    console.error("trial/start error:", e);
+    return res.status(500).json({ error: e?.message || "Falha ao ativar teste grátis." });
+  }
+});
 async function requireSuperAdmin(req, res, next) {
   try {
     const uid = req.user?.uid;
