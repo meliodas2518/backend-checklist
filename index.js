@@ -303,12 +303,12 @@ app.post("/trial/start", requireFirebaseAuth, async (req, res) => {
       {
         trialUsado: true,
         trialAtivo: true,
-        trialTipo: "7_dias",
+        trialTipo: "7 dias",
         trialInicio: agora,
         trialFim: fim,
 
         autorizado: true,
-        plano: "trial_7dias",
+        plano: "teste 7 dias",
         acessosPermitidos: 1,
         vencimento: fim,
 
@@ -381,7 +381,80 @@ app.post("/portal/set-access", requireFirebaseAuth, requireSuperAdmin, async (re
     return res.status(500).json({ error: e?.message || "Falha ao atualizar acesso" });
   }
 });
+app.post("/portal/create-user", requireFirebaseAuth, requireSuperAdmin, async (req, res) => {
+  try {
+    const {
+      nome,
+      email,
+      senha,
+      rolePortal,
+      postosPermitidos,
+      portalOnly,
+    } = req.body || {};
 
+    if (!nome || !email || !senha) {
+      return res.status(400).json({ error: "nome, email e senha são obrigatórios" });
+    }
+
+    if (!rolePortal || !["admin", "super_admin"].includes(String(rolePortal))) {
+      return res.status(400).json({ error: "rolePortal inválido" });
+    }
+
+    const listaPostos = Array.isArray(postosPermitidos)
+      ? postosPermitidos.map((p) => String(p).trim()).filter(Boolean)
+      : [];
+
+    // cria usuário no Firebase Auth
+    const userRecord = await admin.auth().createUser({
+      email: String(email).trim(),
+      password: String(senha),
+      displayName: String(nome).trim(),
+    });
+
+    const uid = userRecord.uid;
+
+    const modulos = portalOnly
+      ? {
+          portal: true,
+          checklist: false,
+          analise: false,
+        }
+      : {
+          portal: true,
+          checklist: true,
+          analise: true,
+        };
+
+    await db.collection("usuarios").doc(uid).set(
+      {
+        nome: String(nome).trim(),
+        email: String(email).trim(),
+        autorizado: true,
+        rolePortal: String(rolePortal),
+        postosPermitidos: rolePortal === "super_admin" ? [] : listaPostos,
+        modulos,
+        criadoEm: admin.firestore.FieldValue.serverTimestamp(),
+        criadoPorAdminUid: String(req.user.uid),
+      },
+      { merge: true }
+    );
+
+    return res.json({
+      ok: true,
+      uid,
+      email: String(email).trim(),
+    });
+  } catch (e) {
+    console.error("portal/create-user error:", e);
+
+    const msg = String(e?.message || "");
+    if (msg.toLowerCase().includes("email already exists")) {
+      return res.status(400).json({ error: "Este e-mail já existe no Auth." });
+    }
+
+    return res.status(500).json({ error: e?.message || "Falha ao criar usuário do portal" });
+  }
+});
 // ===============================
 // Telegram
 // ===============================
@@ -465,7 +538,7 @@ function mustHaveMP(req, res) {
 }
 
 const PLANS = {
-  mensal: { label: "Mensal", price: 1.99, months: 1, acessos: 1 },
+  mensal: { label: "Mensal", price: 24.99, months: 1, acessos: 1 },
   trimestral: { label: "Trimestral", price: 64.99, months: 3, acessos: 1 },
   anual: { label: "Anual", price: 149.99, months: 12, acessos: 1 },
   anual_plus: { label: "Anual Plus", price: 189.99, months: 12, acessos: 2 },
