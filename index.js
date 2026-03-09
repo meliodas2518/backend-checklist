@@ -43,6 +43,7 @@ const upload = multer({
 const PORT = process.env.PORT || 3000;
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
 const SIGNING_SECRET = String(process.env.SIGNING_SECRET || "").trim();
+const APK_DOWNLOAD_URL = String(process.env.APK_DOWNLOAD_URL || "").trim();
 
 if (!SIGNING_SECRET) {
   console.warn("⚠️ SIGNING_SECRET não definido (recomendado para /drive-file assinado)");
@@ -252,7 +253,20 @@ function verifySignedToken(fileId, token) {
 // ===============================
 app.get("/", (req, res) => res.send("OK"));
 app.get("/portal/ping", (req, res) => res.json({ ok: true, name: "portal-api" }));
+app.get("/download-apk", (req, res) => {
+  try {
+    if (!APK_DOWNLOAD_URL) {
+      return res.status(500).json({
+        error: "APK_DOWNLOAD_URL não configurado no backend",
+      });
+    }
 
+    return res.redirect(APK_DOWNLOAD_URL);
+  } catch (e) {
+    console.error("download-apk error:", e);
+    return res.status(500).json({ error: "Falha ao redirecionar download do APK" });
+  }
+});
 // ===============================
 // Auth middlewares
 // ===============================
@@ -651,7 +665,7 @@ app.post("/mp/webhook", async (req, res) => {
 // ===============================
 app.post("/upload-foto", async (req, res) => {
   try {
-    const { codigoPosto, runId, itemId, mime, base64 } = req.body || {};
+    const { codigoPosto, runId, itemId, mime, base64 } = req.body;
 
     if (!codigoPosto || !runId || !itemId || !base64) {
       return res.status(400).json({ error: "faltando codigoPosto/runId/itemId/base64" });
